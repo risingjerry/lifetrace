@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a capability or a new source
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What question should lifetrace be able to answer?
+      placeholder: "e.g. how long did I spend in meetings this week"
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed solution or data source
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy impact
+      description: What new data would be recorded, and how is it kept local and redacted?

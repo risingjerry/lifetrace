@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift build
+        run: swift build
+      - name: Swift tests
+        run: swift test
+      - name: Python tests (system python3)
+        run: python3 -m unittest discover -s Tests -t . -v
+      - name: Smoke (temporary data dir, no permissions)
+        run: |
+          export LIFETRACE_HOME="$(mktemp -d)" LIFETRACE_CONFIG=/dev/null
+          .build/debug/lifetrace --version
+          .build/debug/lifetrace status --json
+          .build/debug/lifetrace schema --json > /dev/null
+          .build/debug/lifetrace timeline today --json
+          python3 -m lifetrace_sources run --dry-run --data-dir "$LIFETRACE_HOME"
+          python3 -m lifetrace_sources status --json --data-dir "$LIFETRACE_HOME"

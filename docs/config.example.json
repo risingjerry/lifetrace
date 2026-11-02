@@ -1,0 +1,10 @@
+{
+  "utc_offset": "+08:00",
+  "idle_threshold_s": 60,
+  "content": true,
+  "input_counts": true,
+  "browser_applescript": false,
+  "git_roots": ["~/Projects", "~/work"],
+  "git_authors": ["you@example.com"],
+  "extra_readers": []
+}

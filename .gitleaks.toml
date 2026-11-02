@@ -1,0 +1,7 @@
+# The redaction tests feed fake secret-shaped strings through the redactors on purpose.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "synthetic redaction-test fixtures"
+paths = ['''^Tests/''']
