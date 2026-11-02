@@ -9,7 +9,7 @@ import re
 import subprocess
 
 from .core import (APPLE, CHROME, UTC, apple, chrome, clean, digest, event,
-                   iso, parse_time, short, snapshot, unix)
+                   iso, parse_time, short, snapshot, unix, database_stamp, file_stamp, tree_files)
 
 # Searched for git repositories (top level + one container level) unless config `git_roots` is set.
 DEFAULT_GIT_ROOTS = ('~/Developer', '~/Projects', '~/projects', '~/Code', '~/code', '~/src',
@@ -32,31 +32,24 @@ class Context:
         self.issues.append({'target': str(target), 'reason': type(error).__name__})
 
 
-def history_paths(home):
+def history_paths(home, cache=None):
     support = home / 'Library/Application Support'
     found = []
+    cache = {} if cache is None else cache
     if support.exists():
-        # Chromium nests profiles at most three levels below its vendor root.
         for vendor in support.iterdir():
             if not vendor.is_dir():
                 continue
-            for parent, dirs, files in os.walk(vendor, followlinks=False):
-                relative = Path(parent).relative_to(vendor)
-                dirs[:] = [d for d in dirs if d not in
-                           {'Cache', 'Code Cache', 'GPUCache', 'node_modules', 'Service Worker'}]
-                if len(relative.parts) >= 3:
-                    dirs[:] = []
-                if 'History' in files:
-                    app = vendor.name
-                    if vendor.name == 'Google' and relative.parts:
-                        app = 'Google ' + relative.parts[0]
-                    elif vendor.name == 'Microsoft' and relative.parts:
-                        app = 'Microsoft ' + relative.parts[0]
-                    elif vendor.name == 'BraveSoftware':
-                        app = 'Brave'
-                    found.append((Path(parent) / 'History', app, str(relative)))
+            for path in tree_files(vendor, cache, lambda n: n == 'History', max_depth=3,
+                                   prune={'Cache', 'Code Cache', 'GPUCache', 'node_modules', 'Service Worker'}):
+                relative = path.parent.relative_to(vendor)
+                app = vendor.name
+                if vendor.name in ('Google', 'Microsoft') and relative.parts:
+                    app += ' ' + relative.parts[0]
+                elif vendor.name == 'BraveSoftware':
+                    app = 'Brave'
+                found.append((path, app, str(relative)))
     safari = home / 'Library/Safari/History.db'
-    # open/stat is a file read, not an EventKit/Automation permission request.
     try:
         safari.stat()
         found.append((safari, 'Safari', 'Default'))
@@ -68,16 +61,20 @@ def history_paths(home):
 
 
 def browser(ctx, state):
-    paths = history_paths(ctx.home)
+    paths = history_paths(ctx.home, state.setdefault('_discovery', {}))
     ctx.details['databases'] = len(paths)
     if not paths:
         ctx.details['availability'] = 'missing'
     for path, app, profile in paths:
         key = digest(str(path))
         try:
+            stamp = database_stamp(path)
             stat = path.stat()
             generation = [stat.st_dev, stat.st_ino]
             old = state.get(key, {})
+            if old.get('stamp') == stamp:
+                ctx.details['unchanged_databases'] = ctx.details.get('unchanged_databases', 0) + 1
+                continue
             existing = old.get('generation') == generation
             cursor = old.get('id', 0) if existing else 0
             with snapshot(path) as con:
@@ -107,7 +104,7 @@ def browser(ctx, state):
                     yield event('browser', 'visit', apple(r['visit_time']) if app == 'Safari'
                                 else chrome(r['visit_time']), [key, generation, r['id'], r['visit_time']], **fields)
                     cursor = max(cursor, r['id'])
-            state[key] = dict(id=max(cursor, boundary), generation=generation)
+            state[key] = dict(id=max(cursor, boundary), generation=generation, stamp=stamp)
         except Exception as exc:
             ctx.issue(app + '/' + profile, exc)
 
@@ -320,11 +317,24 @@ def shell(ctx, state):
     tail = old.get('tail', [])
     floor = ctx.floor(bool(old))
     estimated = 0
+    plain_commands = set(old.get('plain_commands', []))
     with path.open('rb') as stream:
         replaced = old.get('inode') != st.st_ino or st.st_size < offset
         if offset and not replaced and old.get('anchor'):
             stream.seek(max(0, offset - 128))
             replaced = digest(stream.read(min(offset, 128)).hex()) != old['anchor']
+        # Upgrade pre-text-identity cursors from the already imported prefix.
+        # If the file has changed, plain lines cannot safely be called new.
+        if old and 'plain_commands' not in old:
+            stream.seek(0)
+            for _, end, line in history_records(stream):
+                if not replaced and end > offset:
+                    break
+                if not _EXTENDED.match(line):
+                    plain_commands.add(digest(line))
+            plain_commands.update(t['text'] for t in tail
+                                  if isinstance(t, dict) and 'record' not in t)
+        previous_plain = plain_commands.copy()
         if replaced:
             offset = resume_after(stream, tail) if old and tail else 0
         stream.seek(offset)
@@ -333,17 +343,26 @@ def shell(ctx, state):
             when = unix(match[1]) if match else ctx.now
             if not match:
                 estimated += 1
-            tail = (tail + [history_command(line)])[-3:]
+            command_id = history_command(line)
+            tail = (tail + [command_id])[-3:]
+            text_hash = command_id['text']
+            # Plain positions/times are unstable on trim. zsh also gives retained
+            # plain commands a fake timestamp and duration 0 when rewriting them.
+            if text_hash in previous_plain and (not match or (replaced and int(match[2]) == 0)):
+                continue
             if when >= floor:
+                if not match:
+                    plain_commands.add(text_hash)
                 # Exact lines are identified by content so a rewritten file cannot duplicate them.
-                identity = [key, line] if match else [key, position, digest(line)]
+                identity = [key, line] if match else [key, position, text_hash]
                 yield event('shell', 'command', when, identity,
                             command=short(match[3] if match else line, 8192),
                             duration_s=int(match[2]) if match else None,
                             ts_estimated=not bool(match), position=position)
         stream.seek(max(0, offset - 128))
         anchor = digest(stream.read(min(offset, 128)).hex())
-    state[key] = dict(inode=st.st_ino, offset=offset, anchor=anchor, tail=tail)
+    state[key] = dict(inode=st.st_ino, offset=offset, anchor=anchor, tail=tail,
+                      plain_commands=sorted(plain_commands))
     ctx.details['timestamp_less_records'] = estimated
 
 
@@ -396,6 +415,23 @@ def repositories(home, config=None):
     return sorted(set(result.values()))
 
 
+def git_stamp(repo):
+    dot = repo / '.git'
+    if dot.is_file():
+        dot = (repo / dot.read_text().strip().removeprefix('gitdir: ')).resolve()
+    commonfile = dot / 'commondir'
+    common = (dot / commonfile.read_text().strip()).resolve() if commonfile.exists() else dot
+    paths = [dot / 'HEAD', dot / 'logs/HEAD', common / 'packed-refs', common / 'config',
+             common / 'shallow', common / 'info/grafts']
+    # Any ref can introduce reachable commits, including nested/custom namespaces.
+    for root in (common / 'refs', dot / 'refs', common / 'reftable'):
+        if root.exists():
+            for parent, dirs, files in os.walk(root):
+                paths.append(Path(parent))
+                paths.extend(Path(parent) / n for n in files)
+    return digest([(str(p), file_stamp(p)) for p in sorted(set(paths))])
+
+
 def git(ctx, state):
     repos = repositories(ctx.home, ctx.config)
     ctx.details['repositories'] = len(repos)
@@ -404,11 +440,17 @@ def git(ctx, state):
     for repo in repos:
         key = digest(str(repo))
         try:
+            revision = git_stamp(repo)
+            old = state.get(key, {})
+            if old.get('stamp') == revision:
+                ctx.details['unchanged_repositories'] = ctx.details.get('unchanged_repositories', 0) + 1
+                if old.get('empty'):
+                    ctx.details['empty_repositories'] = ctx.details.get('empty_repositories', 0) + 1
+                continue
             config = git_cmd(repo, 'config', '--get-regexp', r'^user\.(name|email)$', allowed=(0, 1))
             # The repo's effective user.name/user.email plus config `git_authors`.
             authors = {str(a).casefold() for a in ctx.config.get('git_authors', []) if a}
             authors.update(line.split(' ', 1)[1].casefold() for line in config.splitlines() if ' ' in line)
-            old = state.get(key, {})
             try:
                 # Snapshot ALL refs before log. Reading heads afterwards can
                 # acknowledge a concurrent commit that log never saw.
@@ -416,6 +458,7 @@ def git(ctx, state):
             except RuntimeError:
                 if not git_cmd(repo, 'show-ref', '--head', '--hash', allowed=(0, 1)).strip():
                     ctx.details['empty_repositories'] = ctx.details.get('empty_repositories', 0) + 1
+                    state[key] = dict(heads=[], stamp=revision, empty=True)
                     continue
                 raise
             args = ['log', *heads, '--format=%x1e%H%x00%aI%x00%an%x00%ae%x00%s', '--numstat', '-z']
@@ -450,7 +493,7 @@ def git(ctx, state):
                 yield event('git', 'commit', stamp, [key, sha], repo=str(repo), commit_hash=sha,
                             subject=subject, files_changed=count, insertions=additions,
                             deletions=deletions)
-            state[key] = dict(heads=sorted(set(heads)))
+            state[key] = dict(heads=sorted(set(heads)), stamp=revision)
         except Exception as exc:
             ctx.issue('repository', exc)
 
@@ -465,12 +508,14 @@ def media_projects(ctx, state):
             return
         candidates[app, str(path)] = (name or path.stem, when, clock)
 
+    discovery = state.setdefault('_discovery', {})
     for app in ('JianyingPro', 'CapCut'):
         for root in (ctx.home / 'Movies' / app, ctx.home / 'Library/Application Support' / app):
             if not root.exists():
                 continue
             # Metadata only, never parse the potentially huge timeline contents.
-            for path in root.rglob('root_meta_info.json'):
+            metadata = sorted(tree_files(root, discovery, lambda n: n in ('root_meta_info.json', 'draft_meta_info.json')))
+            for path in (p for p in metadata if p.name == 'root_meta_info.json'):
                 try:
                     d = json.loads(path.read_text())
                     for item in d.get('all_draft_store', []):
@@ -485,7 +530,7 @@ def media_projects(ctx, state):
                 except Exception as exc:
                     ctx.issue(app, exc)
             # Some versions lack a root list. JSON metadata may be encrypted; don't guess.
-            for path in root.rglob('draft_meta_info.json'):
+            for path in (p for p in metadata if p.name == 'draft_meta_info.json'):
                 if (app, str(path.parent)) not in candidates:
                     add(app, path.parent, stamp=unix(path.stat().st_mtime))
     ae = ctx.home / 'Library/Preferences/Adobe/After Effects'
@@ -511,19 +556,39 @@ def media_projects(ctx, state):
             ctx.issue('Blender', exc)
     # Final Cut libraries are packages, not ordinary .fcp project files.
     movies = ctx.home / 'Movies'
-    if movies.exists():
-        for parent, dirs, _ in os.walk(movies):
-            depth = len(Path(parent).relative_to(movies).parts)
-            for name in list(dirs):
+    # Find bundle markers via cached directory listings, without entering media packages.
+    pending = [(movies, 0)]
+    while pending:
+        parent, depth = pending.pop()
+        try:
+            if not parent.exists():
+                continue
+            key = digest('final_cut', str(parent))
+            stamp = file_stamp(parent)
+            old = discovery.get(key, {})
+            if old.get('stamp') == stamp:
+                dirs = old['dirs']
+            else:
+                with os.scandir(parent) as entries:
+                    dirs = [e.name for e in entries if e.is_dir()]
+                if clean(dirs) == dirs and file_stamp(parent) == stamp:
+                    discovery[key] = dict(stamp=stamp, dirs=dirs)
+                else:
+                    discovery.pop(key, None)
+        except OSError as exc:
+            ctx.issue('Final Cut', exc)
+            continue
+        for name in dirs:
+            try:
+                library = parent / name
                 if name.endswith('.fcpbundle'):
-                    library = Path(parent) / name
                     stamps = [library.stat().st_mtime]
-                    for db in library.glob('*.flexolibrary*'):
-                        stamps.append(db.stat().st_mtime)
+                    stamps.extend(db.stat().st_mtime for db in library.glob('*.flexolibrary*'))
                     add('Final Cut', library, stamp=unix(max(stamps)))
-                    dirs.remove(name)
-            if depth >= 3:
-                dirs[:] = []
+                elif depth < 3 and not library.is_symlink():
+                    pending.append((library, depth + 1))
+            except OSError as exc:
+                ctx.issue('Final Cut', exc)
     ctx.details['projects'] = len(candidates)
     if not candidates:
         ctx.details['availability'] = 'missing'

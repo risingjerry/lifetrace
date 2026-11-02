@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+from urllib.parse import unquote_plus
 
 UTC = dt.timezone.utc
 APPLE = dt.datetime(2001, 1, 1, tzinfo=UTC)
@@ -91,20 +92,88 @@ _PATTERNS = [
     r'-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\Z)',
     r'''(?i)\b(?:authorization["']?\s*[:=]\s*["']?)?bearer\s+[^\s,"';]+["']?''',
     r'''(?i)\b(?:password|passwd|pwd|api[_-]?key|access[_-]?(?:token|key)|token|secret|authorization|密码|口令|令牌)\b["']?\s*[:=]\s*(?:"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|[^\s,;&]+)''',
+    r'(?<!\d)1[3-9]\d{9}(?!\d)',
+    r"(?i)(?<![a-z0-9.!#$%&'*+/=?^_`{|}~-])[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",
     r'\bsk-[A-Za-z0-9_-]{6,}',
     r'\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})',
     r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b',
     r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
-    r'(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])',
-    r'(?<![A-Za-z0-9_/-])[A-Za-z0-9_+/=-]{40,}(?![A-Za-z0-9_/-])',
+    r'(?<![A-Za-z0-9])(?=[A-Fa-f0-9]*[A-Fa-f])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])',
+    # Like the recorder: length alone is not evidence of a token, and '/' is
+    # structural in URLs. Keep standalone slash-bearing base64 covered too.
+    r'(?<![A-Za-z0-9_+/=-])(?=[A-Za-z0-9_+=-]*[0-9])(?=[A-Za-z0-9_+=-]*[a-z])(?=[A-Za-z0-9_+=-]*[A-Z])[A-Za-z0-9_+=-]{40,}(?![A-Za-z0-9_+/=-])',
+    r"""(?<![^\s"'(\[{])(?=[A-Za-z0-9_+/=-]*[0-9])(?=[A-Za-z0-9_+/=-]*[a-z])(?=[A-Za-z0-9_+/=-]*[A-Z])[A-Za-z0-9_+/=-]{40,}(?=$|[\s"')\]},;])""",
 ]
 _REDACT = [re.compile(p) for p in _PATTERNS]
 
 
-def redact(text):
-    for pattern in _REDACT:
+_PARAM = re.compile(r"[?&#;]([^?&#;=\s<>\"']+)=")
+_PARAM_END = re.compile(r"[&#;\s<>\"']")
+_QUOTED_PARAM = re.compile(r'''"(?:\\.|[^"\\\n])*(?:"|(?=\n|\Z))|'(?:\\.|[^'\\\n])*(?:'|(?=\n|\Z))''')
+_SENSITIVE_PARAM = re.compile(
+    r'(?i)(?:phone|mobile|tel|email|lat|latitude|lng|lon|longitude|flat|flng|tlat|tlng|'
+    r'coordinates?|location|geo|geolocation|token|key|secret|auth|authorization|'
+    r'session|sid|sig|signature|code|password|passwd|pwd|openid|unionid|uid|userid|idcard)')
+
+
+def _sensitive_param(name):
+    name = unquote_plus(name)
+    # CamelCase, snake_case and hyphenated aliases, plus *_key_id / open_id.
+    words = re.sub(r'([a-z])([A-Z])', r'\1_\2', name).lower()
+    return (_SENSITIVE_PARAM.fullmatch(re.sub(r'[_-]', '', words)) or
+            any(_SENSITIVE_PARAM.fullmatch(w) for w in re.split(r'[_\-.\[\]]+', words)))
+
+
+def _redact_assignments(text):
+    names = iter(_PARAM.finditer(text))
+    name = next(names, None)
+    def replace(match):
+        nonlocal name
+        while name is not None and name.end() <= match.start():
+            name = next(names, None)
+        # Only URL parameter names are exempt; CLI flags and dotted keys are not.
+        if name is not None and name.start() <= match.start() < name.end():
+            return text[match.start():name.end()] + '[REDACTED]'
+        return '[REDACTED]'
+    return _REDACT[2].sub(replace, text)
+
+
+def _redact_url_values(text):
+    spans, end = [], 0
+    for name in _PARAM.finditer(text):
+        if name.end() > end:
+            boundary = _PARAM_END.search(text, name.end())
+            end = boundary.start() if boundary else len(text)
+        # '?' can be data inside a value, including a nested query-like string.
+        if _sensitive_param(name[1]) and (not spans or name.end() > spans[-1][1]):
+            quoted = _QUOTED_PARAM.match(text, name.end())
+            spans.append((name.end(), quoted.end() if quoted else end))
+    parts, position = [], 0
+    for start, end in spans:
+        parts.extend((text[position:start], '[REDACTED]'))
+        position = end
+    parts.append(text[position:])
+    return ''.join(parts)
+
+
+def _redact_tokens(text):
+    for pattern in _REDACT[3:]:
         text = pattern.sub('[REDACTED]', text)
     return text
+
+
+def redact(text):
+    for pattern in _REDACT[:2]:
+        text = pattern.sub('[REDACTED]', text)
+    text = _redact_url_values(_redact_assignments(text))
+    parts, position = [], 0
+    for name in _PARAM.finditer(text):
+        # Scrub values separately so an email cannot consume '?q=' or other keys.
+        parts.extend((_redact_tokens(text[position:name.start()]),
+                      name[0][0] + _redact_tokens(name[1]) + '='))
+        position = name.end()
+    parts.append(_redact_tokens(text[position:]))
+    return ''.join(parts)
 
 
 class VerifiedMediaPath(str):
@@ -114,9 +183,10 @@ class VerifiedMediaPath(str):
 
 def redact_media_path(path):
     # Remove credentials/PEMs BEFORE splitting, including quoted values with '/'.
-    # The final two generic token rules would otherwise destroy structural hashes.
-    for pattern in _REDACT[:-2]:
+    # Preserve structural hashes before phone/email and generic token rules.
+    for pattern in _REDACT[:2]:
         path = pattern.sub('[REDACTED]', path)
+    path = _redact_assignments(path)
     return '/'.join(part if re.fullmatch(r'[A-Fa-f0-9]{32}(?:_(?:t|h|thumb))?(?:\.[A-Za-z0-9]{1,10})?', part)
                     else redact(part) for part in path.split('/'))
 
@@ -171,6 +241,67 @@ def atomic_json(path, value):
             os.close(fd)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def file_stamp(path):
+    """JSON-stable identity/revision; ctime also catches chmod and same-size rewrites."""
+    try:
+        st = Path(path).stat()
+        return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+    except FileNotFoundError:
+        return None
+
+
+def database_stamp(path):
+    return [file_stamp(str(path) + suffix) for suffix in ('', '-wal')]
+
+
+def tree_files(root, cache, wanted, *, max_depth=None, prune=(), on_error=None):
+    """Cache directory listings, not whole subtrees: nested edits still get stat'ed.
+
+    Only directory names and matching filenames are retained, never file contents.
+    Secret-looking names disable caching that listing instead of storing raw text.
+    """
+    root = Path(root)
+    pending = [(root, 0)]
+    while pending:
+        parent, depth = pending.pop()
+        try:
+            stamp = file_stamp(parent)
+        except OSError as exc:
+            if on_error is not None:
+                on_error(exc)
+            continue  # Match os.walk/rglob: inaccessible discovery branches are skipped.
+        if stamp is None:
+            continue
+        key = digest(str(parent))
+        old = cache.get(key, {})
+        if old.get('stamp') == stamp:
+            dirs, files = old['dirs'], old['files']
+        else:
+            dirs, files = [], []
+            try:
+                with os.scandir(parent) as entries:
+                    for entry in entries:
+                        if entry.is_symlink() and entry.is_dir():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in prune:
+                                dirs.append(entry.name)
+                        elif wanted(entry.name):
+                            files.append(entry.name)
+            except OSError as exc:
+                if on_error is not None:
+                    on_error(exc)
+                continue
+            if clean([dirs, files]) == [dirs, files] and file_stamp(parent) == stamp:
+                cache[key] = dict(stamp=stamp, dirs=dirs, files=files)
+            else:
+                cache.pop(key, None)
+        for name in files:
+            yield parent / name
+        if max_depth is None or depth < max_depth:
+            pending.extend((parent / name, depth + 1) for name in dirs)
 
 
 @contextlib.contextmanager

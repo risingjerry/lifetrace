@@ -14,6 +14,7 @@ python3 -m lifetrace_sources run
 python3 -m lifetrace_sources run --source browser --source git --since 2026-11-01T00:00:00+08:00
 python3 -m lifetrace_sources run --backfill-days 14 --data-dir /tmp/lifetrace-example --dry-run
 python3 -m lifetrace_sources status --json
+python3 -m lifetrace_sources rescrub --data-dir /tmp/lifetrace-example --dry-run
 python3 -m unittest discover -s Tests -t .
 ```
 
@@ -56,6 +57,37 @@ python3 -m unittest discover -s Tests -t .
   replay; normal incremental runs do not scan the whole history. Corrupt or unterminated JSONL is reported, **never silently
   truncated or appended through**. Manually inspect/repair the file if this occurs.
 
+### Re-sanitize saved records
+
+`python3 -m lifetrace_sources rescrub --data-dir DIR [--dry-run]` re-applies the
+current sanitizer to `DIR/sources/*/*.jsonl`. It prints one `act.v1` object with
+`query:"sources.rescrub"`, `dry_run`, `files` (processed files), `records` (read
+records), and `changed` (records whose sanitized values differ). Dry runs create
+no files or locks. Without `--dry-run`, each file is streamed into a private
+sibling, fsynced and atomically replaced with mode **0600**, under the source's
+writer lock. Record order, stable `id`s and Git `hash`es are preserved; cursor and
+status files are untouched. Previously saved `media_path` strings are scrubbed
+conservatively, without assuming they still carry verified-path provenance.
+Corrupt/incomplete input or a busy writer returns an `act.v1` error and exit 2;
+the failing file stays intact. Earlier files may already have been scrubbed, so
+retrying is safe. This command is explicit maintenance, never run automatically.
+
+To clean historical shell replay bursts, preview and then explicitly apply:
+
+```sh
+python3 -m lifetrace_sources rescrub --data-dir DIR --dedupe-shell-estimated --dry-run
+python3 -m lifetrace_sources rescrub --data-dir DIR --dedupe-shell-estimated
+```
+
+This adds `removed` to the summary. Within `DIR/sources/shell/*.jsonl`, in day-file
+and line order, it keeps the first estimated (`ts_estimated: true`) record per
+stored `command` and drops later estimated duplicates, even across days.
+Timestamped records, records without a string command and other sources are not
+deduplicated. This intentionally collapses legitimate repeats whose execution
+times are unknown too; preview before applying. The same writer lock, private
+atomic per-file rewrite and error behavior apply. It does not restore fields
+already replaced by `[REDACTED]` or modify cursors/status files.
+
 ## Redaction and identities
 
 All free-form strings, including titles, URLs, paths, names, prompts, commands and
@@ -65,7 +97,19 @@ unterminated blocks), full Bearer credentials (before assignment matching), and
 quoted/unquoted `key=value` / `key: value` assignments for password, passwd, pwd,
 api_key/apikey, access_key/access_token, token, secret, authorization, 密码, 口令,
 令牌 (including the existing hyphenated key aliases). Sanitization
-precedes truncation. Prompts are bounded by **UTF-8 bytes**, not characters.
+precedes truncation. Generic base64-like tokens require at least 40 characters
+with uppercase, lowercase and digits; URL path separators are not part of that
+match. A separate standalone-blob rule covers slash-bearing base64 credentials.
+Purely numeric IDs are not treated as hex secrets; ordinary URL paths and readable
+slugs survive. URL query and fragment parameter **values** (including empty
+values and percent-encoded parameter names) are replaced with `[REDACTED]` for
+phone/mobile/tel, email, lat/lng/lon/flat/flng/tlat/tlng/latitude/longitude,
+coordinate/location/geo, token/access_token/*_token, key/*_key/*_key_id, secret,
+auth, session/sid, sig/signature, code, password/pwd, openid/open_id/unionid,
+uid/user_id and idcard/id_card aliases. Names and useful nonsensitive parameters
+such as `q` and `page` remain. Standalone mainland mobile numbers (`1[3-9]` plus
+nine digits, not within a longer digit run) and email addresses are scrubbed in
+all free text as well. Prompts are bounded by **UTF-8 bytes**, not characters.
 
 Structural `id` and Git `hash` are identifiers, not free-form text; preserve them
 for dedupe/commit resolution. Only `media_path` fields that a reader marks as
@@ -77,6 +121,27 @@ redaction. This is heuristic defense-in-depth, **not a guarantee that all
 possible credentials or personal data are removed**. No raw content is logged on
 exceptions. Session state stores redacted metadata and counts, never prompt/tool
 text.
+
+## Incremental work and discovery
+
+Unchanged browser DB **and WAL** revisions (device/inode, size, nanosecond mtime
+and ctime) skip snapshot copying and SQL entirely. Git skips subprocesses when
+HEAD, logs/HEAD, recursive refs (including custom namespaces), packed-refs,
+reftable and repository configuration metadata are unchanged. Fingerprints are
+captured **before** reading, so concurrent changes trigger a later retry rather
+than being acknowledged unseen. Empty repositories are cached too. Existing
+cursors migrate on the first successful read; that first run is not steady state.
+
+Browser and media metadata discovery cache per-directory listings.
+Every known nested directory is still stat'ed: a top-level mtime alone cannot
+prove its subtree is unchanged. New nested files/directories are discovered via
+their immediate parent's revision. Secret-looking names disable that listing's
+cache rather than persisting raw text. Media projects still check the referenced
+project files and Final Cut DB/WAL mtimes even when their discovery dirs are
+unchanged. Discovery traversal depth and supported inputs are unchanged.
+`unchanged_databases` / `unchanged_repositories` report fast-path counts when used;
+an unchanged DB is not reopened, so this is not a new SQLite permission probe.
+File revision metadata is not a content hash or an arbitrary-rewrite change feed.
 
 ## Readers, kinds and fields
 
@@ -156,17 +221,25 @@ advancement. Without timestamps, **ts is the reader's first observation**,
 not execution time; even a 24-hour backfill includes all unseen timestamp-less
 lines. A file can mix both: old plain lines stay estimated, timestamped lines get
 their exact time. Cursor: inode, byte offset, a short tail fingerprint to detect
-rewrites, and hashed identities for the last 3 commands. Identity: timestamped records = history
-path + full line; plain records = path + position + content hash (same command at two
-positions is two records). When zsh rewrites the file (SAVEHIST trim; with
-EXTENDED_HISTORY it also turns old plain lines into `: <rewrite time>:0;cmd`), the
-reader resumes after the last 3 commands it already read, matching
-`epoch + duration + command` for records originally timestamped. Only originally plain records use
-command-text fallback (including when zsh adds timestamps),
-so retained history is not re-emitted with fake timestamps; if they are not found it
-re-reads the whole file. Legacy text-only tail state cannot prove timestamp identity,
-so a rewrite replays it through stable-ID dedupe rather than risk skipping new
-repeated commands. Incomplete lines are retried.
+rewrites, hashed identities for the last 3 commands and hashes of imported plain
+commands (never their raw text). Initial backfill includes every plain record,
+including repeats; subsequent reads ignore previously imported plain command
+text, irrespective of position or observation time. New plain command text can
+still be imported. Identity: timestamped records = history path + full line;
+initial plain records = path + position + content hash.
+
+On a rewrite, the reader resumes after its three-record tail when present;
+otherwise it scans from the beginning and stable-ID dedupe handles timestamped
+replays. Retained plain commands are not re-emitted. zsh's conversion of imported
+plain commands to `: <rewrite time>:0;cmd` is suppressed by command hash during
+rewrites too. A genuine duration-zero execution of the same formerly plain command
+in a rewrite cannot be distinguished from conversion and is conservatively
+suppressed; normal timestamped appends and nonzero-duration executions survive.
+Older cursors are upgraded from the already-read prefix when intact, or retained
+plain lines and plain tail hashes on rewrite. Already-converted commands missing
+from both an old cursor's tail and its file cannot be reconstructed. Legacy
+text-only tails cannot prove timestamp identity, so timestamped history is replayed
+through stable-ID dedupe. Incomplete lines are retried.
 
 For exact command times put `setopt EXTENDED_HISTORY INC_APPEND_HISTORY` in your
 `~/.zshrc`. **This implementation does not edit dotfiles** or recover timestamps
@@ -302,7 +375,10 @@ and granting Full Disk Access are your decisions.
 `python3 -m unittest discover -s Tests -t .` runs synthetic fixtures for every
 reader: source clock conversion, cursors, replay/append crash recovery,
 redaction, WAL, local-day splits, extra-reader loading and failure isolation.
-They never read your real home directory.
+They never read your real home directory. `python3 Tests/benchmark_sources.py`
+measures warm no-change and few-new-record reads using temporary synthetic inputs
+(32 browser DBs, 54 repositories, transcript and media metadata fixtures), and
+asserts that new records are observed. It never loads real config or readers.
 
 Not covered by tests: launchd scheduling, real TCC denials (denials are
 simulated), every Final Cut/Blender/CapCut version, custom project locations,

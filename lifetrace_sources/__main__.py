@@ -5,10 +5,12 @@ import datetime as dt
 import fcntl
 import importlib.util
 import json
+import os
+import tempfile
 from pathlib import Path
 import time
 
-from .core import CONFIG, DEFAULT_DATA, UTC, Sink, atomic_json, iso, load_json, parse_time
+from .core import CONFIG, DEFAULT_DATA, UTC, Sink, atomic_json, iso, load_json, parse_time, clean
 from .readers import Context, READERS, git_roots
 
 READERS = dict(READERS)
@@ -100,6 +102,68 @@ def status(data_dir, home=None, config=None):
     return dict(v='act.v1', query='sources.status', data_dir=str(data_dir), sources=results)
 
 
+def rescrub(data_dir, dry_run=False, *, dedupe_shell_estimated=False):
+    """Stream each day file into a private sibling, replacing only complete files."""
+    result = dict(v='act.v1', query='sources.rescrub', dry_run=dry_run,
+                  files=0, records=0, changed=0)
+    estimated_commands = set()
+    if dedupe_shell_estimated:
+        result['removed'] = 0
+    for root in sorted((Path(data_dir) / 'sources').glob('*')):
+        if not root.is_dir():
+            continue
+        with contextlib.ExitStack() as stack:
+            if not dry_run:
+                lock = stack.enter_context((root / '.run.lock').open('a'))
+                (root / '.run.lock').chmod(0o600)
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for path in sorted(root.glob('*.jsonl')):
+                name = None
+                output = None
+                try:
+                    if not dry_run:
+                        fd, name = tempfile.mkstemp(prefix='.rescrub-', dir=root)
+                        output = os.fdopen(fd, 'w')
+                    with path.open() as stream:
+                        for line in stream:
+                            if not line.endswith('\n'):
+                                raise ValueError('incomplete_jsonl')
+                            row = json.loads(line)
+                            scrubbed = clean(row)
+                            # Structural identities must survive historical sanitation.
+                            scrubbed['id'] = row['id']
+                            if row.get('source') == 'git' and 'hash' in row:
+                                scrubbed['hash'] = row['hash']
+                            result['records'] += 1
+                            if (dedupe_shell_estimated and root.name == 'shell' and
+                                    row.get('ts_estimated') is True and isinstance(row.get('command'), str)):
+                                command = row['command']
+                                if command in estimated_commands:
+                                    result['removed'] += 1
+                                    continue
+                                estimated_commands.add(command)
+                            result['changed'] += scrubbed != row
+                            if output is not None:
+                                output.write(json.dumps(scrubbed, ensure_ascii=False, separators=(',', ':')) + '\n')
+                    if output is not None:
+                        output.flush()
+                        os.fsync(output.fileno())
+                        output.close()
+                        os.replace(name, path)
+                        fd = os.open(root, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    result['files'] += 1
+                finally:
+                    if output is not None:
+                        output.close()
+                    if name is not None:
+                        Path(name).unlink(missing_ok=True)
+    return result
+
+
 def main(argv=None):
     extra, failed = load_extra_readers()
     READERS.update(extra)
@@ -114,7 +178,21 @@ def main(argv=None):
     check = commands.add_parser('status')
     check.add_argument('--json', action='store_true')
     check.add_argument('--data-dir', type=Path, default=DEFAULT_DATA)
+    scrub = commands.add_parser('rescrub')
+    scrub.add_argument('--data-dir', type=Path, default=DEFAULT_DATA)
+    scrub.add_argument('--dry-run', action='store_true')
+    scrub.add_argument('--dedupe-shell-estimated', action='store_true',
+                       help='Keep only the first estimated shell record per stored command')
     args = parser.parse_args(argv)
+    if args.command == 'rescrub':
+        try:
+            result = rescrub(args.data_dir.expanduser(), args.dry_run,
+                             dedupe_shell_estimated=args.dedupe_shell_estimated)
+        except Exception as exc:
+            print(json.dumps(dict(v='act.v1', error=type(exc).__name__)))
+            return 2
+        print(json.dumps(result))
+        return 0
     if args.command == 'status':
         result = status(args.data_dir.expanduser())
         result['sources'] += failed
