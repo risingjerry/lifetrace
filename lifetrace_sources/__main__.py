@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 import time
 
-from .core import CONFIG, DEFAULT_DATA, UTC, Sink, atomic_json, iso, load_json, parse_time, clean
+from .core import CONFIG, DEFAULT_DATA, UTC, Sink, atomic_json, iso, load_json, parse_time, clean, redact_media_path
 from .readers import Context, READERS, git_roots
 
 READERS = dict(READERS)
@@ -134,6 +134,10 @@ def rescrub(data_dir, dry_run=False, *, dedupe_shell_estimated=False):
                             scrubbed['id'] = row['id']
                             if row.get('source') == 'git' and 'hash' in row:
                                 scrubbed['hash'] = row['hash']
+                            # Stored media paths only kept 32-hex parts when the reader verified them
+                            # (VerifiedMediaPath); rescrub them with the same rule, not the free-text one.
+                            if isinstance(row.get('media_path'), str):
+                                scrubbed['media_path'] = redact_media_path(row['media_path'])
                             result['records'] += 1
                             if (dedupe_shell_estimated and root.name == 'shell' and
                                     row.get('ts_estimated') is True and isinstance(row.get('command'), str)):

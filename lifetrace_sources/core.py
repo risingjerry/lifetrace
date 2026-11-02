@@ -93,7 +93,9 @@ _PATTERNS = [
     r'''(?i)\b(?:authorization["']?\s*[:=]\s*["']?)?bearer\s+[^\s,"';]+["']?''',
     r'''(?i)\b(?:password|passwd|pwd|api[_-]?key|access[_-]?(?:token|key)|token|secret|authorization|密码|口令|令牌)\b["']?\s*[:=]\s*(?:"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|[^\s,;&]+)''',
     r'(?<!\d)1[3-9]\d{9}(?!\d)',
-    r"(?i)(?<![a-z0-9.!#$%&'*+/=?^_`{|}~-])[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",
+    # Same local-part set as the recorder (Activity.swift): no '/', '=', '?' or '&', so URL
+    # paths and query strings around an address are not swallowed.
+    r"(?i)(?<![a-z0-9._%+-])[a-z0-9._%+-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",
     r'\bsk-[A-Za-z0-9_-]{6,}',
     r'\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})',
     r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b',

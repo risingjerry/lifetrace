@@ -120,6 +120,19 @@ class Fixtures(unittest.TestCase):
                     for i, url in enumerate(urls)])
         self.assertEqual(cli.rescrub(self.data)['changed'], 0)
 
+    def test_rescrub_keeps_verified_media_path_hashes(self):
+        media = '/x/msg/attach/' + '1300900b61034e8dd85b2c35adb546ac' + '/2026-10/' + 'a' * 32 + '.mp4'
+        self.jsonl(self.data / 'sources/chat/2026-11-01.jsonl',
+                   [dict(v='act.v1', id='m1', source='chat', media_path=media, text='call 13800000000')])
+        self.assertEqual(cli.rescrub(self.data)['changed'], 1)
+        row = json.loads((self.data / 'sources/chat/2026-11-01.jsonl').read_text())
+        self.assertEqual(row['media_path'], media)
+        self.assertNotIn('13800000000', row['text'])
+
+    def test_email_in_url_path_keeps_host(self):
+        self.assertEqual(core.redact('https://mail.example.com/inbox/jane.doe@example.org'),
+                         'https://mail.example.com/inbox/[REDACTED]')
+
     def test_url_parameters_and_free_text_privacy(self):
         names = ('phone mobile tel email lat lng lon flat flng tlat tlng coordinate '
                  'coordinates location geo token access_token daijia_token key api_key '
