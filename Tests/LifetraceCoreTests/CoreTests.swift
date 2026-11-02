@@ -257,6 +257,11 @@ final class QueryTests: PinnedZoneCase {
         XCTAssertEqual(dia.map(\.url), ["https://github.com/demo/pulls", "https://news.example.org/a", nil])  // title match; in-segment; other browser ignored
         XCTAssertEqual(dia[0].host, "github.com"); XCTAssertEqual(dia[0].urlSrc, "history")
         XCTAssertNil(out.first { $0.app == "code" }?.url)
+        // No title match: the page shown longest wins over a later redirect hop.
+        let hop = Query.backfillURLs(segs([ev(0, "recorder.start"), app(0, "Dia", title: "me"), ev(300, "recorder.stop")]),
+                                     sources: [visit(5, "https://x.com/someone", "Someone / X"),
+                                               visit(290, "https://t.co/abc", "Repo"), visit(292, "https://github.com/o/r", "Repo")])
+        XCTAssertEqual(hop.first?.url, "https://x.com/someone")
         let j = Query.timeline(day: "2026-11-01", segs: segs(evs), events: evs, sources: src)
         guard case .a(let items)? = j["items"] else { return XCTFail() }
         XCTAssertEqual(items.first?["url_src"]?.str, "history")

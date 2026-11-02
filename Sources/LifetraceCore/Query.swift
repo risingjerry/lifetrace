@@ -74,7 +74,7 @@ public enum Query {
 
     /// Browser segments with no live URL (Chromium browsers rarely expose it) get one from browser history
     /// records (`source.browser.visit`, field `browser` = app name): the latest visit up to the segment end
-    /// whose title matches the window title (within `historyLookbackMs`), else the latest visit inside the segment.
+    /// whose title matches the window title (within `historyLookbackMs`), else the page opened during the segment that stayed longest (or, untitled, the longest shown).
     /// Filled-in segments carry `urlSrc = "history"`.
     struct Visit { let ts: Int64; let url: String; let title: String }
 
@@ -105,7 +105,17 @@ public enum Query {
                 if !v.title.isEmpty && titleMatches(v.title, cands) { return v }
             }
         }
-        return visits.last { (v: Visit) -> Bool in v.ts >= s.startMs && v.ts <= s.endMs }
+        // No title match: the page shown longest during the segment. A visit lasts until the next visit in
+        // the same browser, so a redirect hop (t.co, login bounces) gets a second and loses to the real page.
+        var best: Visit?, bestMs: Int64 = 0
+        for (i, v) in visits.enumerated() where v.ts <= s.endMs {
+            let until = i + 1 < visits.count ? visits[i + 1].ts : Int64.max
+            let overlap = min(until, s.endMs) - max(v.ts, s.startMs)
+            // A page opened before the segment only counts when the window title cannot contradict it.
+            let eligible = v.ts >= s.startMs || (cands.isEmpty && v.ts >= s.startMs - historyLookbackMs)
+            if eligible && overlap > bestMs { best = v; bestMs = overlap }
+        }
+        return best
     }
 
     /// Chat records (any source record with `chat_name`, e.g. a messenger reader) that happened during a focus
