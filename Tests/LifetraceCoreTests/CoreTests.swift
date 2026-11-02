@@ -340,15 +340,15 @@ final class RedactTests: PinnedZoneCase {
     }
 
     func testMasksPersonalData() {
-        let u = Redact.url("https://example.com/x?h=1#/order-list?from=app&phone=13800000000&flat=29.5&flng=106.5&lat=29.5&lng=106.5&open_id=o1&city_id=18&timestamp=1793022927917")
+        let u = Redact.url("https://example.com/x?h=1#/order-list?from=app&phone=13800000000&flat=29.5&flng=106.5&lat=29.5&lng=106.5&open_id=o1&city_id=18&timestamp=1700000000000")
         for leak in ["13800000000", "29.5", "106.5", "open_id=o1"] { XCTAssertFalse(u.contains(leak), u) }
-        for kept in ["from=app", "city_id=18", "timestamp=1793022927917", "h=1"] { XCTAssertTrue(u.contains(kept), u) }
+        for kept in ["from=app", "city_id=18", "timestamp=1700000000000", "h=1"] { XCTAssertTrue(u.contains(kept), u) }
         let q = Redact.url("https://example.com/s?q=swift&page=2&mobile=13900000000&user_email=a%40b.com")
         XCTAssertTrue(q.contains("q=swift") && q.contains("page=2"), q)
         XCTAssertFalse(q.contains("13900000000") || q.contains("a%40b.com"), q)
-        let t = Redact.apply("call 13700000000 or mail jane.doe@example.com; order 1793022927917, id 12345678901")
+        let t = Redact.apply("call 13700000000 or mail jane.doe@example.com; order 1700000000000, id 12345678901")
         XCTAssertFalse(t.contains("13700000000") || t.contains("jane.doe@example.com"), t)
-        XCTAssertTrue(t.contains("1793022927917") && t.contains("12345678901"), t)
+        XCTAssertTrue(t.contains("1700000000000") && t.contains("12345678901"), t)
     }
 
     func testCapAndHash() {

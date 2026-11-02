@@ -147,12 +147,12 @@ class Fixtures(unittest.TestCase):
                     self.assertEqual(core.redact(url), expected)
                     self.assertEqual(core.redact(expected), expected)
         example = ('https://example.test/x?h=1#/order-list?phone=13800000000&flat=29.5&flng=106.5'
-                   '&lat=29.5&lng=106.5&open_id=&access_key_id=37&daijia_token=&timestamp=1793022927917')
+                   '&lat=29.5&lng=106.5&open_id=&access_key_id=37&daijia_token=&timestamp=1700000000000')
         scrubbed = core.redact(example)
         for value in ('13800000000', '29.5', '106.5', 'access_key_id=37'):
             self.assertNotIn(value, scrubbed)
         self.assertIn('h=1#/order-list?phone=[REDACTED]', scrubbed)
-        self.assertIn('timestamp=1793022927917', scrubbed)
+        self.assertIn('timestamp=1700000000000', scrubbed)
         self.assertEqual(core.redact('https://example.test?%70hone=123&open_id=&q=hello'),
                          'https://example.test?%70hone=[REDACTED]&open_id=[REDACTED]&q=hello')
         for value in ('person@example.test', '13800000000'):
