@@ -95,6 +95,139 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(row['hash'], 'a' * 40)
         self.assertEqual(row['subject'], '[REDACTED]')
 
+    def test_url_parameters_and_free_text_privacy(self):
+        names = ('phone mobile tel email lat lng lon flat flng tlat tlng coordinate '
+                 'coordinates location geo token access_token daijia_token key api_key '
+                 'access_key_id secret auth session sid sig signature code password pwd '
+                 'openid open_id unionid uid user_id idcard id_card latitude longitude '
+                 'phoneNumber userLocation geo_location access-key-id api-token access-token PHONE').split()
+        for name in names:
+            for delimiter in ('?', '&', '#', '#/route?'):
+                with self.subTest(name=name, delimiter=delimiter):
+                    url = 'https://example.test/x' + delimiter + name + '=fake-value&page=2'
+                    expected = 'https://example.test/x' + delimiter + name + '=[REDACTED]&page=2'
+                    self.assertEqual(core.redact(url), expected)
+                    self.assertEqual(core.redact(expected), expected)
+        example = ('https://example.test/x?h=1#/order-list?phone=13800000000&flat=29.5&flng=106.5'
+                   '&lat=29.5&lng=106.5&open_id=&access_key_id=37&daijia_token=&timestamp=1793022927917')
+        scrubbed = core.redact(example)
+        for value in ('13800000000', '29.5', '106.5', 'access_key_id=37'):
+            self.assertNotIn(value, scrubbed)
+        self.assertIn('h=1#/order-list?phone=[REDACTED]', scrubbed)
+        self.assertIn('timestamp=1793022927917', scrubbed)
+        self.assertEqual(core.redact('https://example.test?%70hone=123&open_id=&q=hello'),
+                         'https://example.test?%70hone=[REDACTED]&open_id=[REDACTED]&q=hello')
+        for value in ('person@example.test', '13800000000'):
+            self.assertEqual(core.redact('https://example.test?' + value + '=value'),
+                             'https://example.test?[REDACTED]=value')
+        text = 'call 13800000000 or 19900000000; mail person+tag@example.test'
+        self.assertEqual(core.redact(text), 'call [REDACTED] or [REDACTED]; mail [REDACTED]')
+        for text in ('https://example.test/path?q=hello&page=2#/route?sort=asc',
+                     'plain text 12345; plate=blue; language=en; code review',
+                     '013800000000 138000000001 12800000000'):
+            self.assertEqual(core.redact(text), text)
+
+    def test_privacy_cli_assignments_url_boundaries_and_verified_hashes(self):
+        for text in ('--password=demo-pass', '--token=demo-token', '--api-key=demo-key',
+                     'config.password=demo-pass', 'settings.token=demo-token'):
+            with self.subTest(text=text):
+                self.assertNotIn(text.split('=', 1)[1], core.redact(text))
+        for prefix in ('https://example.test?', 'https://example.test#/route?'):
+            for name in ('token', 'password', 'access-token'):
+                url = prefix + name + '=prefix?private-suffix&page=2'
+                expected = prefix + name + '=[REDACTED]&page=2'
+                self.assertEqual(core.redact(url), expected)
+            for value in ('person+tag@example.test', '13800000000'):
+                self.assertEqual(core.redact(prefix + 'q=' + value + '&page=2'),
+                                 prefix + 'q=[REDACTED]&page=2')
+        for name in ('token', 'lat'):
+            for value in ('"short secret"', "'29.5'"):
+                self.assertEqual(core.redact('https://example.test?' + name + '=' + value + '&page=2'),
+                                 'https://example.test?' + name + '=[REDACTED]&page=2')
+        self.assertEqual(core.redact('https://example.test?q=https://nested.test?token=private&page=2'),
+                         'https://example.test?q=https://nested.test?token=[REDACTED]&page=2')
+        md5 = 'a' * 10 + '13800000000' + 'b' * 11
+        self.assertEqual(len(md5), 32)
+        path = f'/cache/{md5}/{md5}_thumb.jpg'
+        self.assertEqual(core.redact_media_path(core.VerifiedMediaPath(path)), path)
+        self.assertNotIn('13800000000', core.redact(path))
+        self.assertEqual(core.redact_media_path('/cache/13800000000/file.txt'),
+                         '/cache/[REDACTED]/file.txt')
+
+    def test_redaction_long_non_email_token_is_bounded(self):
+        env = dict(os.environ, HOME=str(self.home), LIFETRACE_CONFIG=os.devnull,
+                   LIFETRACE_UTC_OFFSET='+08:00')
+        # A missing left boundary in the email regex retries every token suffix.
+        result = subprocess.run([sys.executable, '-c',
+            "from lifetrace_sources.core import redact; assert redact('x' * 1000000) == '[REDACTED]'"],
+            env=env, capture_output=True, timeout=3, check=True)
+        self.assertEqual(result.stdout, b'')
+
+    def test_rescrub_cli_summary_errors_and_busy_writer(self):
+        import fcntl
+        root = self.data / 'sources/browser'
+        root.mkdir(parents=True)
+        path = root / '2026-11-01.jsonl'
+        self.jsonl(path, [dict(v='act.v1', id='a' * 64, source='browser', text='13800000000')])
+        original = path.read_bytes()
+        env = dict(os.environ, HOME=str(self.home), LIFETRACE_CONFIG=os.devnull,
+                   LIFETRACE_UTC_OFFSET='+08:00')
+        command = [sys.executable, '-m', 'lifetrace_sources', 'rescrub', '--data-dir', str(self.data)]
+        def run(*args):
+            result = subprocess.run(command + list(args), env=env, capture_output=True, timeout=3)
+            self.assertEqual(result.stderr, b'')
+            self.assertEqual(len(result.stdout.splitlines()), 1)
+            return result.returncode, json.loads(result.stdout)
+        code, summary = run('--dry-run')
+        self.assertEqual(code, 0)
+        self.assertEqual(summary, dict(v='act.v1', query='sources.rescrub', dry_run=True,
+                                      files=1, records=1, changed=1))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((root / '.run.lock').exists())
+        with (root / '.run.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code, error = run()
+        self.assertEqual(code, 2)
+        self.assertEqual(error, dict(v='act.v1', error='BlockingIOError'))
+        self.assertEqual(path.read_bytes(), original)
+        path.write_bytes(original + b'{')
+        code, error = run()
+        self.assertEqual(code, 2)
+        self.assertEqual(error, dict(v='act.v1', error='ValueError'))
+        self.assertEqual(path.read_bytes(), original + b'{')
+        self.assertEqual(list(root.glob('.rescrub-*')), [])
+
+    def test_rescrub_atomic_private_order_ids_and_dry_run(self):
+        root = self.data / 'sources/browser'
+        root.mkdir(parents=True)
+        path = root / '2026-11-01.jsonl'
+        rows = [dict(v='act.v1', id='a' * 64, source='browser',
+                     url='https://example.test#/order?phone=13800000000&lat=29.5&q=hello'),
+                dict(v='act.v1', id='b' * 64, source='git', hash='c' * 40,
+                     subject='person@example.test', nested={'phone=plain': '13800000000'})]
+        self.jsonl(path, rows)
+        original = path.read_bytes()
+        expected = dict(v='act.v1', query='sources.rescrub', dry_run=True, files=1, records=2, changed=2)
+        self.assertEqual(cli.rescrub(self.data, True), expected)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((root / '.run.lock').exists())
+        with patch('lifetrace_sources.__main__.os.replace', side_effect=OSError):
+            with self.assertRaises(OSError):
+                cli.rescrub(self.data)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(root.glob('.rescrub-*')), [])
+        self.assertEqual(cli.rescrub(self.data)['changed'], 2)
+        scrubbed = [json.loads(l) for l in path.read_text().splitlines()]
+        self.assertEqual([r['id'] for r in scrubbed], [r['id'] for r in rows])
+        self.assertEqual(scrubbed[1]['hash'], rows[1]['hash'])
+        self.assertNotIn('13800000000', path.read_text())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(cli.rescrub(self.data)['changed'], 0)
+        path.write_bytes(original + b'{')
+        with self.assertRaises(ValueError):
+            cli.rescrub(self.data)
+        self.assertEqual(path.read_bytes(), original + b'{')
+
     def test_day_split_crash_replay_and_atomic_state(self):
         root = self.data / 'sources/browser'
         sink = core.Sink(root)
@@ -262,7 +395,8 @@ class Fixtures(unittest.TestCase):
         self.assertIn('Google Chrome', {r['browser'] for r in rows})
         self.assertEqual(dia['visit_duration'], 1.2)
         self.assertNotIn('hidden', dia['url'])
-        self.assertEqual(self.run_reader('browser')['count'], 0)
+        with patch.object(readers, 'snapshot', side_effect=AssertionError('unchanged DB copied')):
+            self.assertEqual(self.run_reader('browser')['count'], 0)
         con.execute('INSERT INTO visits VALUES(2,1,?,0,2,1)', (stamp + 1000,))
         con.commit()
         self.assertEqual(self.run_reader('browser')['count'], 1)
@@ -293,6 +427,53 @@ class Fixtures(unittest.TestCase):
             r = self.run_reader('browser')
         self.assertEqual(r['status'], 'unavailable')
         self.assertEqual(r['issues'][0]['reason'], 'PermissionError')
+
+    def test_discovery_cache_observes_nested_new_files_and_same_size_edits(self):
+        root = self.path('cache/nested/deep/one.jsonl').parent
+        first = root / 'one.jsonl'
+        first.write_text('old')
+        cache = {}
+        find = lambda: sorted(core.tree_files(self.home / 'cache', cache, lambda n: n.endswith('.jsonl')))
+        self.assertEqual(find(), [first])
+        with patch('lifetrace_sources.core.os.scandir', side_effect=AssertionError('unchanged listing scanned')):
+            self.assertEqual(find(), [first])
+        stamp = (self.home / 'cache').stat().st_mtime_ns
+        second = root / 'two.jsonl'
+        second.write_text('new')
+        self.assertEqual(find(), [first, second])
+        self.assertEqual((self.home / 'cache').stat().st_mtime_ns, stamp)
+        before = core.file_stamp(first)
+        first.write_text('NEW')
+        self.assertNotEqual(core.file_stamp(first), before)
+        first.unlink()
+        self.assertEqual(find(), [second])
+
+    def test_browser_fast_path_matches_forced_query_after_wal_append(self):
+        import copy
+        p = self.path('Library/Application Support/Chromium/Default/History')
+        con = self.db(p, """PRAGMA journal_mode=WAL;
+            CREATE TABLE urls(id INTEGER PRIMARY KEY,url TEXT,title TEXT);
+            CREATE TABLE visits(id INTEGER PRIMARY KEY,url INTEGER,visit_time INTEGER,visit_duration INTEGER,transition INTEGER,from_visit INTEGER);
+            INSERT INTO urls VALUES(1,'https://example.test?q=useful','title');""")
+        self.addCleanup(con.close)
+        stamp = int((NOW - core.CHROME).total_seconds() * 1_000_000)
+        con.execute('INSERT INTO visits VALUES(1,1,?,0,0,0)', (stamp,)); con.commit()
+        state = {}
+        context = lambda: readers.Context(self.home, SINCE, NOW)
+        self.assertEqual(len(list(readers.browser(context(), state))), 1)
+        con.execute('INSERT INTO visits VALUES(2,1,?,0,0,0)', (stamp - 30 * 86400 * 1_000_000,)); con.commit()
+        slow = copy.deepcopy(state)
+        for value in slow.values():
+            if isinstance(value, dict):
+                value.pop('stamp', None)
+        fast_rows = list(readers.browser(context(), state))
+        self.assertEqual(fast_rows, list(readers.browser(context(), slow)))
+        self.assertEqual(len(fast_rows), 1)
+        # New profile under an existing nested directory must be discovered too.
+        new = p.parent / 'nested/Profile 2/History'
+        new.parent.mkdir(parents=True)
+        dest = sqlite3.connect(new); con.backup(dest); dest.close()
+        self.assertEqual(len(list(readers.browser(context(), state))), 1)
 
     def test_claude_prompts_summary_tool_outputs_ignored(self):
         p = self.path('.claude/projects/project/one/subagents/agent-123.jsonl')
@@ -442,6 +623,10 @@ class Fixtures(unittest.TestCase):
         git('commit', '-m', 'backdated', env=dict(os.environ, GIT_AUTHOR_DATE=earlier, GIT_COMMITTER_DATE=earlier))
         self.assertEqual(self.run_reader('git')['count'], 1)
         self.assertEqual(self.events('git')[0]['deletions'], 1)
+        with patch.object(readers, 'git_cmd', side_effect=AssertionError('unchanged git spawned')):
+            self.assertEqual(self.run_reader('git')['count'], 0)
+        with patch.object(readers, 'git_cmd', side_effect=AssertionError('unchanged git spawned')):
+            self.assertEqual(self.run_reader('git')['count'], 0)
         original = readers.git_cmd
         injected = False
         def concurrent_commit(repo_path, *args, **kwargs):
@@ -453,6 +638,7 @@ class Fixtures(unittest.TestCase):
                 git('add', 'example.txt')
                 git('commit', '-m', 'arrived during log')
             return out
+        git('update-ref', 'refs/lifetrace-test/concurrency', row['hash'])
         with patch.object(readers, 'git_cmd', concurrent_commit):
             self.assertEqual(self.run_reader('git')['count'], 0)
         self.assertEqual(self.run_reader('git')['count'], 1)
@@ -479,6 +665,16 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(self.run_reader('media_projects')['count'], 4)
         self.assertEqual({r['app'] for r in self.events('media_projects')}, {'JianyingPro', 'After Effects', 'Blender', 'Final Cut'})
         self.assertEqual(self.run_reader('media_projects')['count'], 0)
+        root_mtime = (self.home / 'Movies').stat().st_mtime_ns
+        os.utime(blend, (NOW.timestamp() + 1, NOW.timestamp() + 1))
+        self.assertEqual(self.run_reader('media_projects')['count'], 1)
+        self.assertEqual((self.home / 'Movies').stat().st_mtime_ns, root_mtime)
+        meta.write_text(json.dumps({'all_draft_store': [dict(draft_fold_path=str(draft.parent),
+            draft_name='Demo', tm_draft_modified=int((NOW.timestamp() + 2) * 1_000_000))]}))
+        self.assertEqual(self.run_reader('media_projects')['count'], 1)
+        nested = self.path('Movies/JianyingPro/new/deep/project/draft_meta_info.json')
+        nested.write_text('{}')
+        self.assertEqual(self.run_reader('media_projects')['count'], 1)
 
     def test_calendar_apple_dates_edit_revision_and_permissions(self):
         p = self.path('Library/Calendars/Calendar Cache')

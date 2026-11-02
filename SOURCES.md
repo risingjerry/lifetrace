@@ -14,6 +14,7 @@ python3 -m lifetrace_sources run
 python3 -m lifetrace_sources run --source browser --source git --since 2026-11-01T00:00:00+08:00
 python3 -m lifetrace_sources run --backfill-days 14 --data-dir /tmp/lifetrace-example --dry-run
 python3 -m lifetrace_sources status --json
+python3 -m lifetrace_sources rescrub --data-dir /tmp/lifetrace-example --dry-run
 python3 -m unittest discover -s Tests -t .
 ```
 
@@ -56,6 +57,21 @@ python3 -m unittest discover -s Tests -t .
   replay; normal incremental runs do not scan the whole history. Corrupt or unterminated JSONL is reported, **never silently
   truncated or appended through**. Manually inspect/repair the file if this occurs.
 
+### Re-sanitize saved records
+
+`python3 -m lifetrace_sources rescrub --data-dir DIR [--dry-run]` re-applies the
+current sanitizer to `DIR/sources/*/*.jsonl`. It prints one `act.v1` object with
+`query:"sources.rescrub"`, `dry_run`, `files` (processed files), `records` (read
+records), and `changed` (records whose sanitized values differ). Dry runs create
+no files or locks. Without `--dry-run`, each file is streamed into a private
+sibling, fsynced and atomically replaced with mode **0600**, under the source's
+writer lock. Record order, stable `id`s and Git `hash`es are preserved; cursor and
+status files are untouched. Previously saved `media_path` strings are scrubbed
+conservatively, without assuming they still carry verified-path provenance.
+Corrupt/incomplete input or a busy writer returns an `act.v1` error and exit 2;
+the failing file stays intact. Earlier files may already have been scrubbed, so
+retrying is safe. This command is explicit maintenance, never run automatically.
+
 ## Redaction and identities
 
 All free-form strings, including titles, URLs, paths, names, prompts, commands and
@@ -65,7 +81,15 @@ unterminated blocks), full Bearer credentials (before assignment matching), and
 quoted/unquoted `key=value` / `key: value` assignments for password, passwd, pwd,
 api_key/apikey, access_key/access_token, token, secret, authorization, 密码, 口令,
 令牌 (including the existing hyphenated key aliases). Sanitization
-precedes truncation. Prompts are bounded by **UTF-8 bytes**, not characters.
+precedes truncation. URL query and fragment parameter **values** (including empty
+values and percent-encoded parameter names) are replaced with `[REDACTED]` for
+phone/mobile/tel, email, lat/lng/lon/flat/flng/tlat/tlng/latitude/longitude,
+coordinate/location/geo, token/access_token/*_token, key/*_key/*_key_id, secret,
+auth, session/sid, sig/signature, code, password/pwd, openid/open_id/unionid,
+uid/user_id and idcard/id_card aliases. Names and useful nonsensitive parameters
+such as `q` and `page` remain. Standalone mainland mobile numbers (`1[3-9]` plus
+nine digits, not within a longer digit run) and email addresses are scrubbed in
+all free text as well. Prompts are bounded by **UTF-8 bytes**, not characters.
 
 Structural `id` and Git `hash` are identifiers, not free-form text; preserve them
 for dedupe/commit resolution. Only `media_path` fields that a reader marks as
@@ -77,6 +101,27 @@ redaction. This is heuristic defense-in-depth, **not a guarantee that all
 possible credentials or personal data are removed**. No raw content is logged on
 exceptions. Session state stores redacted metadata and counts, never prompt/tool
 text.
+
+## Incremental work and discovery
+
+Unchanged browser DB **and WAL** revisions (device/inode, size, nanosecond mtime
+and ctime) skip snapshot copying and SQL entirely. Git skips subprocesses when
+HEAD, logs/HEAD, recursive refs (including custom namespaces), packed-refs,
+reftable and repository configuration metadata are unchanged. Fingerprints are
+captured **before** reading, so concurrent changes trigger a later retry rather
+than being acknowledged unseen. Empty repositories are cached too. Existing
+cursors migrate on the first successful read; that first run is not steady state.
+
+Browser and media metadata discovery cache per-directory listings.
+Every known nested directory is still stat'ed: a top-level mtime alone cannot
+prove its subtree is unchanged. New nested files/directories are discovered via
+their immediate parent's revision. Secret-looking names disable that listing's
+cache rather than persisting raw text. Media projects still check the referenced
+project files and Final Cut DB/WAL mtimes even when their discovery dirs are
+unchanged. Discovery traversal depth and supported inputs are unchanged.
+`unchanged_databases` / `unchanged_repositories` report fast-path counts when used;
+an unchanged DB is not reopened, so this is not a new SQLite permission probe.
+File revision metadata is not a content hash or an arbitrary-rewrite change feed.
 
 ## Readers, kinds and fields
 
@@ -302,7 +347,10 @@ and granting Full Disk Access are your decisions.
 `python3 -m unittest discover -s Tests -t .` runs synthetic fixtures for every
 reader: source clock conversion, cursors, replay/append crash recovery,
 redaction, WAL, local-day splits, extra-reader loading and failure isolation.
-They never read your real home directory.
+They never read your real home directory. `python3 Tests/benchmark_sources.py`
+measures warm no-change and few-new-record reads using temporary synthetic inputs
+(32 browser DBs, 54 repositories, transcript and media metadata fixtures), and
+asserts that new records are observed. It never loads real config or readers.
 
 Not covered by tests: launchd scheduling, real TCC denials (denials are
 simulated), every Final Cut/Blender/CapCut version, custom project locations,
