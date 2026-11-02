@@ -92,7 +92,7 @@ Every command accepts `--json` for structured `act.v1` output (errors return `{"
 | Command | Description |
 |---|---|
 | `lifetrace status [--json]` | Recorder health, PID, memory/CPU footprint, granted permissions, and today's event count. |
-| `lifetrace timeline [DATE] [--raw] [--sources] [--json]` | Ordered focus blocks and away gaps for a day (`today`, `yesterday`, or `YYYY-MM-DD`). `--raw` shows unmerged segments; `--sources` interleaves external sources. |
+| `lifetrace timeline [DATE] [--raw] [--sources] [--json]` | Ordered focus blocks and away gaps for a day (`today`, `yesterday`, or `YYYY-MM-DD`). Fills missing browser URLs from history (`url_src: "history"`) and attaches active messenger `chats` (`[{chat, in, out}]`) when source records exist. `--raw` shows unmerged segments; `--sources` interleaves external sources. |
 | `lifetrace at TIME [--json]` | What was happening at one moment (`"14:30"`, `"2026-10-28 14:30"`, or ISO 8601), plus raw events and sources within ±2 min. |
 | `lifetrace stats [--day DATE \| --week [DATE]] [--top N] [--json]` | Totals, time by app/domain/window, active time by hour, app switches, interruptions, and longest focus block. |
 | `lifetrace search QUERY [--from T] [--to T] [--source NAME\|act] [--limit N] [--json]` | Full-text search across on-screen text snapshots, selections, window titles, URLs, and external source records. |
@@ -138,8 +138,8 @@ lifetrace_sources (stdlib Python readers: browser, claude, codex, shell, git, me
      - `git`: Commits authored by you across your configured git roots.
      - `media_projects`: Modified project metadata for CapCut / JianyingPro, After Effects, Blender, and Final Cut Pro.
      - `calendar`: Events from local Apple Calendar SQLite caches.
-   - Readers never modify the apps they inspect; SQLite databases (plus WAL files) are copied to a private temporary directory before querying.
-   - Add your own custom readers outside the repository via `"extra_readers": ["~/path/to/reader.py"]` in `~/.config/lifetrace/config.json` (see [SOURCES.md](SOURCES.md#extra-readers-your-own-sources)).
+   - Readers never modify the apps they inspect; SQLite databases (plus WAL files) are copied to a private temporary directory before querying, and unchanged browser databases, git repositories, and folders are skipped.
+   - Add your own custom readers outside the repository via `"extra_readers": ["~/path/to/reader.py"]` in `~/.config/lifetrace/config.json` (see [SOURCES.md](SOURCES.md#extra-readers-your-own-sources)). Messenger source records with `chat_name` are also summarized on matching `timeline` focus blocks as `chats: [{chat, in, out}]`.
 
 ### Enabling External Source Readers (Optional)
 
@@ -153,11 +153,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.lifetrace.sources.pl
 
 # Check reader status
 python3 -m lifetrace_sources status
+
+# Re-apply current redaction rules to already stored source records (optional maintenance)
+python3 -m lifetrace_sources rescrub --data-dir ~/.local/share/lifetrace [--dedupe-shell-estimated] [--dry-run]
 ```
 
 ### Resource Footprint
 
-Measured on the maintainer's Apple-silicon Mac while recording (`lifetrace status`), the Swift daemon uses **about 5 MB of memory footprint** and **about 0.04% average CPU** (this is one machine's observation; your mileage may vary with window-switching frequency).
+Measured on the maintainer's Apple-silicon Mac while recording (`lifetrace status`), the Swift daemon uses **about 5 MB of memory footprint** and **about 0.04% average CPU** (this is one machine's observation; your mileage may vary with window-switching frequency). Source readers skip unchanged browser databases, git repositories, and folders, so a steady-state 15-minute run takes **about 2 s** instead of 20–30 s on a real machine.
 
 ---
 
@@ -169,11 +172,11 @@ Measured on the maintainer's Apple-silicon Mac while recording (`lifetrace statu
   - Password fields (`AXSecureTextField`) and their children are never read.
   - Private / Incognito / InPrivate / 无痕 / 隐私浏览 browser windows skip layer-5 content capture (best effort via window title/toolbar).
   - Sensitive apps in `content_exclude_bundles` skip layer-5 content capture by default: password managers (1Password, Bitwarden, Keychain Access, Apple Passwords, KeePassXC, LastPass, Dashlane, Enpass), hardware/crypto wallets (OneKey, Ledger), and banking/payment apps (Alipay, PayPal, CMB, ICBC, CCB, BOC, ABC, BoCom).
-- **Heuristic Redaction:** Before any title, URL, path, on-screen text, shell command, or prompt is written to disk, lifetrace masks common secret patterns as `[REDACTED…]`—including PEM private keys, JWTs, `sk-…`, GitHub PATs (`ghp_…`, `github_pat_…`), AWS access keys, Google `AIza…`, Slack `xox…`, Bearer tokens, URL credential parameters (`token`, `key`, `secret`, `password`, `code`, `session`, etc.), `password=`/`api_key=`/`密码：`/`口令：`/`令牌：` assignments, and long hex/base64-like strings.
+- **Heuristic Redaction:** Before any title, URL, path, on-screen text, shell command, or prompt is written to disk, lifetrace masks secrets and personal data as `[REDACTED…]`—including PEM private keys, JWTs, `sk-…`, GitHub PATs (`ghp_…`, `github_pat_…`), AWS access keys, Google `AIza…`, Slack `xox…`, Bearer tokens, `password=`/`api_key=`/`密码：`/`口令：`/`令牌：` assignments, long hex/base64-like tokens, mainland mobile numbers and e-mail addresses anywhere in text, and URL query/fragment parameters for credentials (`token`, `key`, `secret`, `password`, `code`, `session`, `auth`, `sig`, etc.) as well as personal data (`phone`/`mobile`/`tel`, `email`, coordinates such as `lat`/`lng`/`lon`, account IDs such as `uid`/`openid`/`unionid`/`user_id`, and ID-card numbers `idcard`/`id_card`). Ordinary URL paths and long numeric IDs are kept. To re-apply updated redaction rules to already stored source records (and optionally deduplicate estimated shell history bursts), run `python3 -m lifetrace_sources rescrub --data-dir DIR [--dedupe-shell-estimated] [--dry-run]`.
 - **Permissions and Code Signing:**
   - **Accessibility (`~/.local/bin/lifetrace`):** Required for window titles, document paths, URLs, on-screen text, and input counts. Without it, lifetrace still runs at `"level": "app"` (recording only app names and presence).
   - **Full Disk Access (`python3`, optional):** Only needed if you use `lifetrace_sources` and want Safari history or Apple Calendar events. Without it, those two readers report `unavailable` and all other readers still run.
-  - **Automation (optional, off by default):** Only requested if you set `"browser_applescript": true` in config so Chromium browsers expose the active tab URL.
+  - **Automation (optional, off by default):** Only requested if you set `"browser_applescript": true` in config so Chromium browsers expose the active tab URL on live events (even with it off, `timeline`, `stats`, and `at` fill URLs from browser history once `lifetrace_sources` has run).
   - **Code Signing across Rebuilds:** macOS ties the Accessibility grant to the binary's code-signing requirement (`dev.lifetrace.recorder`). `make` automatically signs with the first `"Apple Development"` certificate in your keychain (or `SIGN_IDENTITY="..."`). If you have no Apple Development certificate, it falls back to ad-hoc signing (`-`), which works but requires re-toggling Accessibility permission after each rebuild.
 
 ---
@@ -195,7 +198,9 @@ Configuration is optional and lives at `~/.config/lifetrace/config.json` (overri
 }
 ```
 
-**Fixed UTC Offset:** Days and timestamps use a single fixed UTC offset—`$LIFETRACE_UTC_OFFSET`, or `"utc_offset"` in `config.json`, or your Mac's UTC offset when the process starts. There is no daylight-saving switching inside a run, keeping day boundaries (`YYYY-MM-DD.jsonl`) unambiguous. Full config details are in [SCHEMA.md](SCHEMA.md) and [SOURCES.md](SOURCES.md).
+**Fixed UTC Offset:** Days and timestamps use a single fixed UTC offset—`$LIFETRACE_UTC_OFFSET`, or `"utc_offset"` in `config.json`, or your Mac's UTC offset when the process starts. There is no daylight-saving switching inside a run, keeping day boundaries (`YYYY-MM-DD.jsonl`) unambiguous.
+
+**Custom Window Titles (`title_commands`):** For apps whose window title says nothing useful (e.g. GPU-drawn terminal workspaces), set `"title_commands": {"bundle.id": ["/abs/path/to/helper"]}` in `config.json`. The helper program prints the real title on line 1 and an optional absolute document/folder path on line 2 (run on focus changes and throttled after input, with a 0.5 s timeout and redaction applied). Full config details are in [SCHEMA.md](SCHEMA.md) and [SOURCES.md](SOURCES.md).
 
 ---
 
@@ -212,7 +217,7 @@ Configuration is optional and lives at `~/.config/lifetrace/config.json` (overri
 ## Limitations
 
 - **macOS 13+ only.** Built directly on `NSWorkspace`, `ApplicationServices` (Accessibility), and `CGEventTap`.
-- **Chromium browsers and on-screen text:** Chrome, Arc, Edge, Brave, and Dia only expose their toolbar to the macOS Accessibility API by default unless full Chromium accessibility is forced on (which lifetrace intentionally does not enable because it costs browser CPU and memory). For Chromium browsers, searchable text comes from window titles and the `browser` history reader, not page bodies; live tab URLs require opting into `"browser_applescript": true`. Safari exposes both URLs and page text natively.
+- **Chromium browsers and on-screen text:** Chrome, Arc, Edge, Brave, and Dia only expose their toolbar to the macOS Accessibility API by default unless full Chromium accessibility is forced on (which lifetrace intentionally does not enable because it costs browser CPU and memory). For Chromium browsers, searchable text comes from window titles and the `browser` history reader, not page bodies. Live tab URLs on raw focus/segment events require opting into `"browser_applescript": true`, but `timeline`, `stats` (`by_domain`), and `at` fill the page URL from browser history automatically (`url_src: "history"`) once the source readers have run. Safari exposes both URLs and page text natively.
 - **Without Accessibility permission**, only frontmost application names and bundle IDs are recorded (`status.level` is `"app"`).
 - **Redaction is heuristic, not a mathematical guarantee.** While common API keys, tokens, and password fields are excluded or masked, treat `~/.local/share/lifetrace` as sensitive personal data.
 - **Built from source, not notarized.** You compile and sign it locally with Xcode Command Line Tools.
@@ -228,7 +233,7 @@ Install lifetrace (`make install`), grant Accessibility permission, and run `lif
 No screenshots, screen recordings, audio, or key identities are ever captured. Input counting (`activity.minute`) uses a listen-only event tap that increments integer counters (`keys`, `clicks`, `scrolls`, `copies`, `pastes`) and immediately discards the event—it never records which key was pressed. On-screen text is read through the macOS Accessibility tree (skipping `AXSecureTextField` password fields, password managers, wallets, banking apps, and private browsing windows) and passed through secret redaction before touching disk.
 
 ### Does it work with Google Chrome, Arc, Brave, or Safari?
-Yes. Safari works out of the box for window titles, URLs, and on-screen page text. For Chromium-based browsers (Chrome, Arc, Brave, Edge, Dia), window titles are captured automatically, full visit history and URLs are imported by the optional `browser` source reader (`lifetrace_sources`), and real-time active tab URLs can be enabled by setting `"browser_applescript": true` in `~/.config/lifetrace/config.json`.
+Yes. Safari works out of the box for window titles, URLs, and on-screen page text. For Chromium-based browsers (Chrome, Arc, Brave, Edge, Dia), window titles are captured automatically, and once the `browser` source reader (`lifetrace_sources`) has run, `timeline`, `stats` (`by_domain`), and `at` automatically fill missing page URLs from browser history (marked `url_src: "history"`). If you also want real-time active tab URLs on live events before the source reader runs, set `"browser_applescript": true` in `~/.config/lifetrace/config.json`.
 
 ### How to let Claude Code or Codex see what I worked on today?
 Install the skill with `npx skills add risingjerry/lifetrace` or register the MCP server (`claude mcp add lifetrace -- python3 /path/to/lifetrace/lifetrace_mcp/__main__.py`). Then ask your agent *"What did I work on today?"* or *"Summarize my week from lifetrace."* The agent will call `lifetrace stats`, `lifetrace timeline`, and `lifetrace search` locally.

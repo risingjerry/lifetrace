@@ -92,7 +92,7 @@ codex mcp add lifetrace -- python3 /path/to/lifetrace/lifetrace_mcp/__main__.py
 | 命令 | 说明 |
 |---|---|
 | `lifetrace status [--json]` | 查看守护进程运行状态、PID、内存与 CPU 占用、权限状态及今日事件数。 |
-| `lifetrace timeline [DATE] [--raw] [--sources] [--json]` | 按时间顺序展示某一天的专注时间块与离开空隙（支持 `today`、`yesterday` 或 `YYYY-MM-DD`）。`--raw` 展示未合并的原始片段；`--sources` 穿插展示外部数据源事件。 |
+| `lifetrace timeline [DATE] [--raw] [--sources] [--json]` | 按时间顺序展示某一天的专注时间块与离开空隙（支持 `today`、`yesterday` 或 `YYYY-MM-DD`）。缺失实时 URL 的浏览器块会自动用历史记录补齐（标记 `url_src: "history"`），聊天应用的专注块还会附带会话列表 `chats`（`[{chat, in, out}]`）。`--raw` 展示未合并的原始片段；`--sources` 穿插展示外部数据源事件。 |
 | `lifetrace at TIME [--json]` | 查询某一时刻正在发生什么（支持 `"14:30"`、`"2026-10-28 14:30"` 或 ISO 8601），并附带前后 2 分钟内的原始事件与外部源记录。 |
 | `lifetrace stats [--day DATE \| --week [DATE]] [--top N] [--json]` | 汇总统计：按应用/域名/窗口统计时长、每小时活跃分布、应用切换次数、被打断次数及最长专注时间块。 |
 | `lifetrace search QUERY [--from T] [--to T] [--source NAME\|act] [--limit N] [--json]` | 全文检索屏幕上见过的文本快照、选中文本、窗口标题、URL 以及外部数据源记录（支持中英文检索）。 |
@@ -138,8 +138,8 @@ lifetrace_sources (Python 标准库读取器: browser, claude, codex, shell, git
      - `git`：指定代码目录下由你提交的 Git commit 记录与改动行数。
      - `media_projects`：剪映专业版（JianyingPro）/ CapCut、After Effects、Blender、Final Cut Pro 的工程修改元数据。
      - `calendar`：本地 Apple 日历 SQLite 缓存中的日程事件。
-   - 读取器绝不修改原应用的数据；读取 SQLite 数据库时，会先将 DB 与 WAL 文件复制到私有临时目录后再查询。
-   - 如需接入私人或工作专属的数据源，可在 `~/.config/lifetrace/config.json` 中通过 `"extra_readers": ["~/path/to/reader.py"]` 加载仓库外部的自定义脚本（详见 [SOURCES.md](SOURCES.md#extra-readers-your-own-sources)）。
+   - 读取器绝不修改原应用的数据；读取 SQLite 数据库时，会先将 DB 与 WAL 文件复制到私有临时目录后再查询，并自动跳过未发生变化的浏览器数据库、Git 仓库与目录。
+   - 如需接入私人或工作专属的数据源，可在 `~/.config/lifetrace/config.json` 中通过 `"extra_readers": ["~/path/to/reader.py"]` 加载仓库外部的自定义脚本（详见 [SOURCES.md](SOURCES.md#extra-readers-your-own-sources)）。带有 `chat_name` 的聊天软件数据源记录还会在 `timeline` 对应的应用专注块中汇总为 `chats: [{chat, in, out}]`。
 
 ### 启用外部数据源读取器（可选）
 
@@ -153,11 +153,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.lifetrace.sources.pl
 
 # 查看各数据源状态
 python3 -m lifetrace_sources status
+
+# 对已落盘的数据源记录重新应用最新脱敏规则（可选维护命令）
+python3 -m lifetrace_sources rescrub --data-dir ~/.local/share/lifetrace [--dedupe-shell-estimated] [--dry-run]
 ```
 
 ### 资源占用
 
-在维护者的 Apple Silicon Mac 上日常记录时实测（通过 `lifetrace status` 查看），Swift 守护进程的**内存占用（footprint）约为 5 MB**，**平均 CPU 占用约为 0.04%**（此为单机实测观察值，实际占用会随窗口切换频率略有浮动）。
+在维护者的 Apple Silicon Mac 上日常记录时实测（通过 `lifetrace status` 查看），Swift 守护进程的**内存占用（footprint）约为 5 MB**，**平均 CPU 占用约为 0.04%**（此为单机实测观察值，实际占用会随窗口切换频率略有浮动）。数据源读取器会自动跳过未变更的浏览器数据库、Git 仓库与文件夹，因此日常每 15 分钟一次的稳态增量运行在真机上仅需**约 2 秒**（而非 20–30 秒）。
 
 ---
 
@@ -169,11 +172,11 @@ python3 -m lifetrace_sources status
   - 密码输入框（`AXSecureTextField`）及其子元素绝不读取。
   - 浏览器无痕/隐私窗口（窗口标题或工具栏包含 Private Browsing / Incognito / InPrivate / 无痕 / 隐私浏览）自动跳过第 5 层正文抓取。
   - 默认排除列表（`content_exclude_bundles`）中的应用不会抓取第 5 层窗口文本：涵盖主流密码管理器（1Password、Bitwarden、钥匙串访问、Apple 密码、KeePassXC、LastPass、Dashlane、Enpass）、硬件/加密钱包（OneKey、Ledger）以及支付与银行应用（支付宝、PayPal、招商银行、工商银行、建设银行、中国银行、农业银行、交通银行）。
-- **启发式自动脱敏：** 在窗口标题、URL、文件路径、屏幕文本、终端命令或 Prompt 写入磁盘前，会自动将常见密钥格式替换为 `[REDACTED…]`——包括 PEM 私钥块、JWT、`sk-…`、GitHub PAT（`ghp_…`、`github_pat_…`）、AWS Access Key、Google `AIza…`、Slack `xox…`、Bearer Token、URL 中的凭证参数（`token`、`key`、`secret`、`password`、`code`、`session` 等）、`password=`/`api_key=`/`密码：`/`口令：`/`令牌：` 赋值语句，以及超长十六进制或 Base64 令牌。
+- **启发式自动脱敏：** 在窗口标题、URL、文件路径、屏幕文本、终端命令或 Prompt 写入磁盘前，lifetrace 不仅屏蔽密钥，还会屏蔽个人隐私数据，统一替换为 `[REDACTED…]`——包括 PEM 私钥块、JWT、`sk-…`、GitHub PAT（`ghp_…`、`github_pat_…`）、AWS Access Key、Google `AIza…`、Slack `xox…`、Bearer Token、`password=`/`api_key=`/`密码：`/`口令：`/`令牌：` 赋值语句、超长十六进制或 Base64 令牌、文本中任意位置的中国大陆手机号与电子邮箱地址，以及 URL 查询参数/Fragment 中的凭证参数（`token`、`key`、`secret`、`password`、`code`、`session`、`auth`、`sig` 等）和个人信息参数（手机号 `phone`/`mobile`/`tel`、邮箱 `email`、经纬度坐标 `lat`/`lng`/`lon` 等、账号 ID `uid`/`openid`/`unionid`/`user_id` 以及身份证号 `idcard`/`id_card`）；普通 URL 路径与纯数字长 ID 则予以保留。如需对已保存的历史数据源记录重新执行最新脱敏规则（或对无精确时间戳的 zsh 历史重复项去重），可运行 `python3 -m lifetrace_sources rescrub --data-dir DIR [--dedupe-shell-estimated] [--dry-run]`。
 - **权限说明与代码签名：**
   - **辅助功能（`~/.local/bin/lifetrace`）：** 用于读取窗口标题、文档路径、URL、窗口文本和输入计数。若未授权，lifetrace 依然能以 `"level": "app"` 模式运行（仅记录前台应用名称与在场状态）。
   - **完全磁盘访问权限（`python3`，可选）：** 仅当你启用 `lifetrace_sources` 且需要读取 Safari 历史记录或 Apple 日历时才需为 `python3` 授权；未授权时这两个读取器会标记为 `unavailable`，不影响其他读取器正常工作。
-  - **自动化权限（Automation，可选，默认关闭）：** 仅当你在配置中主动开启 `"browser_applescript": true` 以获取 Chromium 浏览器当前标签页 URL 时，macOS 才会弹窗询问。
+  - **自动化权限（Automation，可选，默认关闭）：** 仅当你在配置中主动开启 `"browser_applescript": true` 以实时获取 Chromium 浏览器当前标签页 URL 时，macOS 才会弹窗询问（即便关闭，只要运行过 `lifetrace_sources`，查询命令也会自动从浏览器历史补齐 URL）。
   - **重编译与代码签名：** macOS 将辅助功能权限绑定在二进制文件的代码签名标识（`dev.lifetrace.recorder`）与证书上。执行 `make` 时会自动使用钥匙串中找到的第一个 `"Apple Development"` 证书签名（也可通过 `SIGN_IDENTITY="..."` 指定）；如果本机没有 Apple Development 证书，则会回退为 ad-hoc 签名（`-`），此时每次重新编译安装后都需要去系统设置里重新开关一次辅助功能权限。
 
 ---
@@ -195,7 +198,9 @@ python3 -m lifetrace_sources status
 }
 ```
 
-**固定 UTC 偏移量：** 日期切分与时间戳使用单一的固定 UTC 偏移量——优先读取环境变量 `$LIFETRACE_UTC_OFFSET`，其次是 `config.json` 中的 `"utc_offset"`（如 `"+08:00"`），默认则取进程启动时本机的时区偏移。运行期间不做夏令时跳变，从而保证按天切分的日志文件（`YYYY-MM-DD.jsonl`）边界清晰稳定。全部配置项说明见 [SCHEMA.md](SCHEMA.md) 与 [SOURCES.md](SOURCES.md)。
+**固定 UTC 偏移量：** 日期切分与时间戳使用单一的固定 UTC 偏移量——优先读取环境变量 `$LIFETRACE_UTC_OFFSET`，其次是 `config.json` 中的 `"utc_offset"`（如 `"+08:00"`），默认则取进程启动时本机的时区偏移。运行期间不做夏令时跳变，从而保证按天切分的日志文件（`YYYY-MM-DD.jsonl`）边界清晰稳定。
+
+**自定义窗口标题与目录（`title_commands`）：** 对于窗口标题不含有效信息的应用（例如 GPU 自绘终端工作区），可在 `config.json` 中配置 `"title_commands": {"bundle.id": ["/abs/path/to/helper"]}`，由外部程序输出第 1 行真实标题、可选第 2 行文档/工作目录绝对路径（在焦点切换及输入后按节流间隔调用，0.5 秒超时并同样经过脱敏）。全部配置项说明见 [SCHEMA.md](SCHEMA.md) 与 [SOURCES.md](SOURCES.md)。
 
 ---
 
@@ -212,7 +217,7 @@ python3 -m lifetrace_sources status
 ## 局限性说明
 
 - **仅支持 macOS 13+。** 深度依赖 `NSWorkspace`、`ApplicationServices`（Accessibility）与 `CGEventTap`。
-- **Chromium 浏览器的网页正文与 URL：** Chrome、Arc、Edge、Brave、Dia 等 Chromium 浏览器默认只向 macOS 辅助功能暴露浏览器工具栏，除非强制开启 Chromium 全局辅助功能树（这会显著增加浏览器的 CPU 与内存开销，因此 lifetrace 刻意不去触发它）。在 Chromium 浏览器中，检索内容来自窗口标题和 `browser` 历史记录读取器，而非网页正文；如需实时记录当前标签页 URL，需在配置中开启 `"browser_applescript": true`。Safari 则原生暴露 URL 与网页正文。
+- **Chromium 浏览器的网页正文与 URL：** Chrome、Arc、Edge、Brave、Dia 等 Chromium 浏览器默认只向 macOS 辅助功能暴露浏览器工具栏，除非强制开启 Chromium 全局辅助功能树（这会显著增加浏览器的 CPU 与内存开销，因此 lifetrace 刻意不去触发它）。在 Chromium 浏览器中，检索内容来自窗口标题和 `browser` 历史记录读取器，而非网页正文；实时事件中的标签页 URL 需在配置中开启 `"browser_applescript": true`，但只要运行过外部数据源读取器，`timeline`、`stats`（`by_domain`）和 `at` 查询都会自动从浏览器历史中补齐页面 URL（标记为 `url_src: "history"`）。Safari 则原生暴露 URL 与网页正文。
 - **未授予辅助功能权限时**，仅能记录前台应用名称与 Bundle ID（`status.level` 为 `"app"`）。
 - **脱敏是启发式的防御机制，并非绝对的数学保证。** 尽管常见密钥、Token 和密码框均已屏蔽或排除，仍请将 `~/.local/share/lifetrace` 视为高度敏感的个人数据妥善保管。
 - **需从源码编译，未做 Apple 公证（Notarization）。** 通过本机 Xcode Command Line Tools 编译并签名使用。
@@ -228,7 +233,7 @@ python3 -m lifetrace_sources status
 绝对不会截图、不会录屏、不会录音，也不会记录你按下了哪个键。输入统计（`activity.minute`）仅使用只读事件监听对按键、点击、滚动、复制、粘贴做整数累加，事件随即丢弃。屏幕文字仅通过 macOS 辅助功能树读取（自动跳过 `AXSecureTextField` 密码框、密码管理器、钱包、银行应用和无痕浏览窗口），并在写入磁盘前经过密钥脱敏处理。
 
 ### 支持 Google Chrome、Arc、Brave 或 Safari 浏览器吗？
-支持。Safari 开箱即可获取窗口标题、URL 和页面可见文字。对于 Chromium 内核浏览器（Chrome、Arc、Brave、Edge、Dia），默认自动记录窗口标题，完整访问历史与 URL 可通过 `lifetrace_sources` 的 `browser` 读取器增量导入；如果你还希望实时记录当前焦点标签页的 URL，只需在 `~/.config/lifetrace/config.json` 中设置 `"browser_applescript": true`。
+支持。Safari 开箱即可获取窗口标题、URL 和页面可见文字。对于 Chromium 内核浏览器（Chrome、Arc、Brave、Edge、Dia），默认自动记录窗口标题，并且一旦运行了 `lifetrace_sources` 的 `browser` 读取器，`timeline`、`stats`（`by_domain`）和 `at` 查询就会自动从浏览器历史记录补齐缺失的网页 URL（标记 `url_src: "history"`）；如果你还希望在实时事件流中直接记录当前焦点标签页的 URL，只需在 `~/.config/lifetrace/config.json` 中设置 `"browser_applescript": true`。
 
 ### 怎么让 Claude Code 或 Codex 看到我今天在电脑上干了什么？
 运行 `npx skills add risingjerry/lifetrace` 安装技能，或者配置 MCP Server（`claude mcp add lifetrace -- python3 /path/to/lifetrace/lifetrace_mcp/__main__.py`）。然后直接对 Agent 说*“帮我总结一下今天在电脑上干了什么”*或*“用 lifetrace 分析一下我这周的专注情况”*，Agent 就会在本地调用 `lifetrace stats`、`lifetrace timeline` 和 `lifetrace search` 给出回答。
