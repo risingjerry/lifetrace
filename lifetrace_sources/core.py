@@ -98,8 +98,11 @@ _PATTERNS = [
     r'\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})',
     r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b',
     r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
-    r'(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])',
-    r'(?<![A-Za-z0-9_/-])[A-Za-z0-9_+/=-]{40,}(?![A-Za-z0-9_/-])',
+    r'(?<![A-Za-z0-9])(?=[A-Fa-f0-9]*[A-Fa-f])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])',
+    # Like the recorder: length alone is not evidence of a token, and '/' is
+    # structural in URLs. Keep standalone slash-bearing base64 covered too.
+    r'(?<![A-Za-z0-9_+/=-])(?=[A-Za-z0-9_+=-]*[0-9])(?=[A-Za-z0-9_+=-]*[a-z])(?=[A-Za-z0-9_+=-]*[A-Z])[A-Za-z0-9_+=-]{40,}(?![A-Za-z0-9_+/=-])',
+    r"""(?<![^\s"'(\[{])(?=[A-Za-z0-9_+/=-]*[0-9])(?=[A-Za-z0-9_+/=-]*[a-z])(?=[A-Za-z0-9_+/=-]*[A-Z])[A-Za-z0-9_+/=-]{40,}(?=$|[\s"')\]},;])""",
 ]
 _REDACT = [re.compile(p) for p in _PATTERNS]
 

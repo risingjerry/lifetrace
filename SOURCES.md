@@ -72,6 +72,22 @@ Corrupt/incomplete input or a busy writer returns an `act.v1` error and exit 2;
 the failing file stays intact. Earlier files may already have been scrubbed, so
 retrying is safe. This command is explicit maintenance, never run automatically.
 
+To clean historical shell replay bursts, preview and then explicitly apply:
+
+```sh
+python3 -m lifetrace_sources rescrub --data-dir DIR --dedupe-shell-estimated --dry-run
+python3 -m lifetrace_sources rescrub --data-dir DIR --dedupe-shell-estimated
+```
+
+This adds `removed` to the summary. Within `DIR/sources/shell/*.jsonl`, in day-file
+and line order, it keeps the first estimated (`ts_estimated: true`) record per
+stored `command` and drops later estimated duplicates, even across days.
+Timestamped records, records without a string command and other sources are not
+deduplicated. This intentionally collapses legitimate repeats whose execution
+times are unknown too; preview before applying. The same writer lock, private
+atomic per-file rewrite and error behavior apply. It does not restore fields
+already replaced by `[REDACTED]` or modify cursors/status files.
+
 ## Redaction and identities
 
 All free-form strings, including titles, URLs, paths, names, prompts, commands and
@@ -81,7 +97,11 @@ unterminated blocks), full Bearer credentials (before assignment matching), and
 quoted/unquoted `key=value` / `key: value` assignments for password, passwd, pwd,
 api_key/apikey, access_key/access_token, token, secret, authorization, 密码, 口令,
 令牌 (including the existing hyphenated key aliases). Sanitization
-precedes truncation. URL query and fragment parameter **values** (including empty
+precedes truncation. Generic base64-like tokens require at least 40 characters
+with uppercase, lowercase and digits; URL path separators are not part of that
+match. A separate standalone-blob rule covers slash-bearing base64 credentials.
+Purely numeric IDs are not treated as hex secrets; ordinary URL paths and readable
+slugs survive. URL query and fragment parameter **values** (including empty
 values and percent-encoded parameter names) are replaced with `[REDACTED]` for
 phone/mobile/tel, email, lat/lng/lon/flat/flng/tlat/tlng/latitude/longitude,
 coordinate/location/geo, token/access_token/*_token, key/*_key/*_key_id, secret,
@@ -201,17 +221,25 @@ advancement. Without timestamps, **ts is the reader's first observation**,
 not execution time; even a 24-hour backfill includes all unseen timestamp-less
 lines. A file can mix both: old plain lines stay estimated, timestamped lines get
 their exact time. Cursor: inode, byte offset, a short tail fingerprint to detect
-rewrites, and hashed identities for the last 3 commands. Identity: timestamped records = history
-path + full line; plain records = path + position + content hash (same command at two
-positions is two records). When zsh rewrites the file (SAVEHIST trim; with
-EXTENDED_HISTORY it also turns old plain lines into `: <rewrite time>:0;cmd`), the
-reader resumes after the last 3 commands it already read, matching
-`epoch + duration + command` for records originally timestamped. Only originally plain records use
-command-text fallback (including when zsh adds timestamps),
-so retained history is not re-emitted with fake timestamps; if they are not found it
-re-reads the whole file. Legacy text-only tail state cannot prove timestamp identity,
-so a rewrite replays it through stable-ID dedupe rather than risk skipping new
-repeated commands. Incomplete lines are retried.
+rewrites, hashed identities for the last 3 commands and hashes of imported plain
+commands (never their raw text). Initial backfill includes every plain record,
+including repeats; subsequent reads ignore previously imported plain command
+text, irrespective of position or observation time. New plain command text can
+still be imported. Identity: timestamped records = history path + full line;
+initial plain records = path + position + content hash.
+
+On a rewrite, the reader resumes after its three-record tail when present;
+otherwise it scans from the beginning and stable-ID dedupe handles timestamped
+replays. Retained plain commands are not re-emitted. zsh's conversion of imported
+plain commands to `: <rewrite time>:0;cmd` is suppressed by command hash during
+rewrites too. A genuine duration-zero execution of the same formerly plain command
+in a rewrite cannot be distinguished from conversion and is conservatively
+suppressed; normal timestamped appends and nonzero-duration executions survive.
+Older cursors are upgraded from the already-read prefix when intact, or retained
+plain lines and plain tail hashes on rewrite. Already-converted commands missing
+from both an old cursor's tail and its file cannot be reconstructed. Legacy
+text-only tails cannot prove timestamp identity, so timestamped history is replayed
+through stable-ID dedupe. Incomplete lines are retried.
 
 For exact command times put `setopt EXTENDED_HISTORY INC_APPEND_HISTORY` in your
 `~/.zshrc`. **This implementation does not edit dotfiles** or recover timestamps

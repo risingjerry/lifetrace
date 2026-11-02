@@ -317,11 +317,24 @@ def shell(ctx, state):
     tail = old.get('tail', [])
     floor = ctx.floor(bool(old))
     estimated = 0
+    plain_commands = set(old.get('plain_commands', []))
     with path.open('rb') as stream:
         replaced = old.get('inode') != st.st_ino or st.st_size < offset
         if offset and not replaced and old.get('anchor'):
             stream.seek(max(0, offset - 128))
             replaced = digest(stream.read(min(offset, 128)).hex()) != old['anchor']
+        # Upgrade pre-text-identity cursors from the already imported prefix.
+        # If the file has changed, plain lines cannot safely be called new.
+        if old and 'plain_commands' not in old:
+            stream.seek(0)
+            for _, end, line in history_records(stream):
+                if not replaced and end > offset:
+                    break
+                if not _EXTENDED.match(line):
+                    plain_commands.add(digest(line))
+            plain_commands.update(t['text'] for t in tail
+                                  if isinstance(t, dict) and 'record' not in t)
+        previous_plain = plain_commands.copy()
         if replaced:
             offset = resume_after(stream, tail) if old and tail else 0
         stream.seek(offset)
@@ -330,17 +343,26 @@ def shell(ctx, state):
             when = unix(match[1]) if match else ctx.now
             if not match:
                 estimated += 1
-            tail = (tail + [history_command(line)])[-3:]
+            command_id = history_command(line)
+            tail = (tail + [command_id])[-3:]
+            text_hash = command_id['text']
+            # Plain positions/times are unstable on trim. zsh also gives retained
+            # plain commands a fake timestamp and duration 0 when rewriting them.
+            if text_hash in previous_plain and (not match or (replaced and int(match[2]) == 0)):
+                continue
             if when >= floor:
+                if not match:
+                    plain_commands.add(text_hash)
                 # Exact lines are identified by content so a rewritten file cannot duplicate them.
-                identity = [key, line] if match else [key, position, digest(line)]
+                identity = [key, line] if match else [key, position, text_hash]
                 yield event('shell', 'command', when, identity,
                             command=short(match[3] if match else line, 8192),
                             duration_s=int(match[2]) if match else None,
                             ts_estimated=not bool(match), position=position)
         stream.seek(max(0, offset - 128))
         anchor = digest(stream.read(min(offset, 128)).hex())
-    state[key] = dict(inode=st.st_ino, offset=offset, anchor=anchor, tail=tail)
+    state[key] = dict(inode=st.st_ino, offset=offset, anchor=anchor, tail=tail,
+                      plain_commands=sorted(plain_commands))
     ctx.details['timestamp_less_records'] = estimated
 
 

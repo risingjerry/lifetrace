@@ -102,10 +102,13 @@ def status(data_dir, home=None, config=None):
     return dict(v='act.v1', query='sources.status', data_dir=str(data_dir), sources=results)
 
 
-def rescrub(data_dir, dry_run=False):
+def rescrub(data_dir, dry_run=False, *, dedupe_shell_estimated=False):
     """Stream each day file into a private sibling, replacing only complete files."""
     result = dict(v='act.v1', query='sources.rescrub', dry_run=dry_run,
                   files=0, records=0, changed=0)
+    estimated_commands = set()
+    if dedupe_shell_estimated:
+        result['removed'] = 0
     for root in sorted((Path(data_dir) / 'sources').glob('*')):
         if not root.is_dir():
             continue
@@ -132,6 +135,13 @@ def rescrub(data_dir, dry_run=False):
                             if row.get('source') == 'git' and 'hash' in row:
                                 scrubbed['hash'] = row['hash']
                             result['records'] += 1
+                            if (dedupe_shell_estimated and root.name == 'shell' and
+                                    row.get('ts_estimated') is True and isinstance(row.get('command'), str)):
+                                command = row['command']
+                                if command in estimated_commands:
+                                    result['removed'] += 1
+                                    continue
+                                estimated_commands.add(command)
                             result['changed'] += scrubbed != row
                             if output is not None:
                                 output.write(json.dumps(scrubbed, ensure_ascii=False, separators=(',', ':')) + '\n')
@@ -171,10 +181,13 @@ def main(argv=None):
     scrub = commands.add_parser('rescrub')
     scrub.add_argument('--data-dir', type=Path, default=DEFAULT_DATA)
     scrub.add_argument('--dry-run', action='store_true')
+    scrub.add_argument('--dedupe-shell-estimated', action='store_true',
+                       help='Keep only the first estimated shell record per stored command')
     args = parser.parse_args(argv)
     if args.command == 'rescrub':
         try:
-            result = rescrub(args.data_dir.expanduser(), args.dry_run)
+            result = rescrub(args.data_dir.expanduser(), args.dry_run,
+                             dedupe_shell_estimated=args.dedupe_shell_estimated)
         except Exception as exc:
             print(json.dumps(dict(v='act.v1', error=type(exc).__name__)))
             return 2

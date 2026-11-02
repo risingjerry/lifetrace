@@ -95,6 +95,31 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(row['hash'], 'a' * 40)
         self.assertEqual(row['subject'], '[REDACTED]')
 
+    def test_redaction_preserves_ordinary_url_paths_and_masks_mixed_blobs(self):
+        urls = [
+            'https://x.com/someone/status/1985123456789012345',
+            'https://github.com/example/ExampleRepo/blob/main/Sources/Feature2/README.md',
+            'https://example.test/' + 'a-long-readable-article-slug-' * 4,
+            'https://example.test/' + '1234567890' * 6,
+            'https://example.test:8080/ExampleRepo/Feature2/' + 'long-path-' * 5,
+        ]
+        blob = 'aGVsbG8gd29ybGQgdGhpcyBpcyBhIHNlY3JldCB0b2tlbjEyMw=='
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertEqual(core.redact(url), url)
+        for token in (blob, 'AbCd_123+EfGh/456' * 5, 'AbCd_123-EfGh456' * 4,
+                      '/' + blob, blob + '/AbCd1234'):
+            self.assertEqual(core.redact(token), '[REDACTED]')
+            self.assertEqual(core.redact('blob: "' + token + '"'), 'blob: "[REDACTED]"')
+        path = '/cache/' + 'a' * 32 + '/preview.jpg'
+        self.assertEqual(core.redact_media_path(core.VerifiedMediaPath(path)), path)
+        self.assertEqual(core.redact_media_path('/cache/' + blob + '/preview.jpg'),
+                         '/cache/[REDACTED]/preview.jpg')
+        self.jsonl(self.data / 'sources/browser/2026-11-01.jsonl',
+                   [dict(v='act.v1', id=str(i), source='browser', url=url)
+                    for i, url in enumerate(urls)])
+        self.assertEqual(cli.rescrub(self.data)['changed'], 0)
+
     def test_url_parameters_and_free_text_privacy(self):
         names = ('phone mobile tel email lat lng lon flat flng tlat tlng coordinate '
                  'coordinates location geo token access_token daijia_token key api_key '
@@ -159,7 +184,9 @@ class Fixtures(unittest.TestCase):
                    LIFETRACE_UTC_OFFSET='+08:00')
         # A missing left boundary in the email regex retries every token suffix.
         result = subprocess.run([sys.executable, '-c',
-            "from lifetrace_sources.core import redact; assert redact('x' * 1000000) == '[REDACTED]'"],
+            "from lifetrace_sources.core import redact; "
+            "assert redact('x' * 1000000) == 'x' * 1000000; "
+            "assert redact('x' * 999997 + 'A1x') == '[REDACTED]'"],
             env=env, capture_output=True, timeout=3, check=True)
         self.assertEqual(result.stdout, b'')
 
@@ -593,6 +620,90 @@ class Fixtures(unittest.TestCase):
             self.assertEqual(self.events('shell')[-1]['command'], 'echo new3')
             self.assertEqual(len({r['id'] for r in self.events('shell')}), 5)
             self.assertEqual(self.run_reader('shell')['count'], 0)
+
+    def test_shell_trim_without_tail_does_not_replay_plain_or_converted_lines(self):
+        p = self.path('.zsh_history')
+        epoch = int(NOW.timestamp()) - 60
+        p.write_text(f'echo old1\necho old2\necho old3\n: {epoch}:1;echo exact\n')
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.run_reader('shell')['count'], 4)
+            # Trim destroys the three-record tail; plain positions shift.
+            p.write_text(f'echo old2\necho old3\n: {epoch+1}:0;echo new1\n')
+            self.assertEqual(self.run_reader('shell')['count'], 1)
+            # Conversion also happens when no previous tail survives.
+            fresh = self.path('.zsh_history.new')
+            fresh.write_text(f': {epoch+30}:0;echo old3\n: {epoch+2}:0;echo new2\n')
+            os.replace(fresh, p)
+            self.assertEqual(self.run_reader('shell')['count'], 1)
+            self.assertEqual([row['command'] for row in self.events('shell')],
+                             ['echo old1', 'echo old2', 'echo old3', 'echo exact',
+                              'echo new1', 'echo new2'])
+            # A genuine timestamped execution of a formerly plain command on append survives.
+            with p.open('a') as stream:
+                stream.write(f': {epoch+40}:0;echo old3\n')
+            self.assertEqual(self.run_reader('shell')['count'], 1)
+            # A nonzero-duration replay is not a conversion, even on rewrite.
+            p.write_text(f': {epoch+50}:1;echo old3\n')
+            self.assertEqual(self.run_reader('shell')['count'], 1)
+            self.assertEqual(self.events('shell')[-1]['duration_s'], 1)
+
+    def test_shell_legacy_cursor_seeds_plain_hashes_before_rewrite(self):
+        p = self.path('.zsh_history')
+        commands = ['echo old-' + str(i) for i in range(20)]
+        epoch = int(NOW.timestamp()) - 60
+        p.write_text('\n'.join(commands) + f'\n: {epoch}:0;echo exact\n')
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.run_reader('shell')['count'], 21)
+            state_path = self.data / 'sources/shell/.state.json'
+            state = core.load_json(state_path)
+            del state['cursors'][core.digest(str(p))]['plain_commands']
+            core.atomic_json(state_path, state)
+            self.assertEqual(self.run_reader('shell')['count'], 0)
+            cursor = core.load_json(state_path)['cursors'][core.digest(str(p))]
+            self.assertEqual(set(cursor['plain_commands']), {core.digest(c) for c in commands})
+            p.write_text(f'echo old-1\n: {epoch+20}:0;echo old-2\n: {epoch+30}:0;echo new\n')
+            self.assertEqual(self.run_reader('shell')['count'], 1)
+            self.assertEqual(self.events('shell')[-1]['command'], 'echo new')
+
+    def test_rescrub_dedupes_estimated_shell_commands_across_days(self):
+        root = self.data / 'sources/shell'
+        def row(identity, command, estimated=True):
+            return core.event('shell', 'command', NOW, identity,
+                              command=command, ts_estimated=estimated)
+        first = [row('a', 'echo repeat'), row('b', 'echo exact', False),
+                 row('c', 'echo repeat')]
+        second = [row('d', 'echo repeat'), row('e', 'echo exact'),
+                  row('f', 'echo repeat', False), row('g', 'echo unique')]
+        self.jsonl(root / '2026-11-01.jsonl', first)
+        self.jsonl(root / '2026-11-02.jsonl', second)
+        self.jsonl(self.data / 'sources/browser/2026-11-01.jsonl', first)
+        originals = {p: p.read_bytes() for p in root.glob('*.jsonl')}
+        result = cli.rescrub(self.data, True, dedupe_shell_estimated=True)
+        self.assertEqual(result, dict(v='act.v1', query='sources.rescrub', dry_run=True,
+                                     files=3, records=10, changed=0, removed=2))
+        self.assertEqual({p: p.read_bytes() for p in originals}, originals)
+        self.assertFalse((root / '.run.lock').exists())
+        replace = os.replace
+        def fail_shell(source, destination):
+            if destination.parent == root:
+                raise OSError('synthetic replacement failure')
+            replace(source, destination)
+        with patch('lifetrace_sources.__main__.os.replace', side_effect=fail_shell):
+            with self.assertRaises(OSError):
+                cli.rescrub(self.data, dedupe_shell_estimated=True)
+        self.assertEqual({p: p.read_bytes() for p in originals}, originals)
+        self.assertEqual(list(root.glob('.rescrub-*')), [])
+        # Exercise the actual CLI flag and its act.v1 summary as well.
+        result = subprocess.run([sys.executable, '-m', 'lifetrace_sources', 'rescrub',
+                                 '--data-dir', str(self.data), '--dedupe-shell-estimated'],
+                                capture_output=True, timeout=3, check=True)
+        self.assertEqual(result.stderr, b'')
+        self.assertEqual(json.loads(result.stdout), dict(v='act.v1', query='sources.rescrub',
+                         dry_run=False, files=3, records=10, changed=0, removed=2))
+        self.assertEqual(self.events('shell'), [first[0], first[1]] + second[1:])
+        self.assertEqual(self.events('browser'), first)
+        self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in originals))
+        self.assertEqual(cli.rescrub(self.data, dedupe_shell_estimated=True)['removed'], 0)
 
     def test_git_author_stats_worktree_and_backdated_incremental(self):
         repo = self.path('Projects/repo/.git').parent
