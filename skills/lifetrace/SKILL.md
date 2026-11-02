@@ -61,7 +61,7 @@ Do not run `lifetrace_sources run` for real unless asked; its LaunchAgent runs i
 ## Limits
 
 - No images, canvas, audio or key identities. On-screen text is only what Accessibility exposes: native apps and Safari yes; Chromium browsers (Chrome, Arc, Edge, Brave, Dia) only their toolbar, not the page — use titles and the browser-history source. Excluded apps (password managers, wallets, banking apps; `content_exclude_bundles`) and private/incognito windows have no text.
-- Chromium browsers usually have no `url` unless `browser_applescript` is enabled; use `title`.
+- Chromium browsers usually have no live `url`; `timeline`, `stats` and `at` fill it from browser history once the source readers ran (`url_src: "history"` = inferred by title/time, treat as very likely, not certain). Messenger blocks carry `chats` [{chat, in, out}] = messages during that block; `in` counts arrivals, not reading.
 - Without Accessibility permission only app names exist.
 - Gaps with `why: unknown` or `recorder_off` mean the recorder was not running; do not count them as time away from the computer.
 

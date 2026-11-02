@@ -15,6 +15,10 @@ public struct Config {
     public var contentExcludeBundles: [String] = Config.defaultContentExclude
     /// Fixed UTC offset for day files and ISO times, e.g. "+08:00" (see `Zone`). nil = machine offset at start.
     public var utcOffset: String?
+    /// Apps whose window title says little (e.g. a GPU-drawn terminal workspace): bundle id -> argv of a command
+    /// that prints the real context. Line 1 = title, optional line 2 = an absolute document/folder path.
+    /// Run (timeout 0.5 s) on focus changes and at most once per title_throttle_s while there is input in that app.
+    public var titleCommands: [String: [String]] = [:]
 
     public static let defaultContentExclude = [
         "com.1password.*", "com.agilebits.*", "com.bitwarden.desktop", "com.apple.keychainaccess", "com.apple.Passwords",
@@ -45,6 +49,13 @@ public struct Config {
         if let v = j["content"]?.bool { c.content = v }
         if case .a(let xs)? = j["content_exclude_bundles"] { c.contentExcludeBundles = xs.compactMap(\.str) }
         if let v = j["utc_offset"]?.str, Zone.parseOffset(v) != nil { c.utcOffset = v }
+        if case .o(let kv)? = j["title_commands"] {
+            for (b, v) in kv {
+                guard case .a(let xs) = v else { continue }
+                let argv = xs.compactMap(\.str)
+                if argv.first?.hasPrefix("/") == true { c.titleCommands[b] = argv }
+            }
+        }
         return c
     }
 
@@ -52,7 +63,8 @@ public struct Config {
         .o([("idle_threshold_s", .d(idleThresholdS)), ("idle_poll_s", .d(idlePollS)), ("title_throttle_s", .d(titleThrottleS)),
             ("glance_s", .d(glanceS)), ("ax", .b(ax)), ("browser_applescript", .b(browserAppleScript)),
             ("input_counts", .b(inputCounts)), ("content", .b(content)),
-            ("content_exclude_bundles", .a(contentExcludeBundles.map { .s($0) })), ("utc_offset", .s(Zone.suffix))])
+            ("content_exclude_bundles", .a(contentExcludeBundles.map { .s($0) })), ("utc_offset", .s(Zone.suffix)),
+            ("title_commands", .o(titleCommands.sorted { $0.key < $1.key }.map { ($0.key, .a($0.value.map { .s($0) })) }))])
     }
 }
 
