@@ -19,6 +19,8 @@ public struct Seg {
     public var doc: String?
     public var url: String?
     public var host: String?
+    /// "history" when `url` was filled in from browser history at query time (not seen live).
+    public var urlSrc: String?
 
     public init(_ e: Event) {
         seg = e.str("seg") ?? ""

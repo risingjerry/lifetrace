@@ -242,6 +242,51 @@ final class QueryTests: PinnedZoneCase {
         XCTAssertEqual(items[1]["why"]?.str, "lock")
     }
 
+    func testBrowserURLBackfillFromHistory() {
+        let evs = [ev(0, "recorder.start"), app(0, "Dia", title: "me: Pull requests · demo…"), app(100, "code"),
+                   app(200, "Dia", title: "me: New Tab"), app(280, "code"), app(300, "Dia", title: "me: Unseen page"), ev(400, "recorder.stop")]
+        func visit(_ s: Double, _ url: String, _ title: String, browser: String = "Dia") -> Event {
+            ev(s, "source.browser.visit", [("source", .s("browser")), ("id", .s(url)), ("url", .s(url)), ("title", .s(title)), ("browser", .s(browser))])
+        }
+        let src = [visit(-3000, "https://github.com/demo/pulls", "Pull requests · demo/app"),
+                   visit(-10, "https://example.com/other", "Other"),
+                   visit(250, "https://news.example.org/a", "Story A"),
+                   visit(310, "https://wrong.example/", "Unseen page", browser: "Google Chrome")]
+        let out = Query.backfillURLs(segs(evs), sources: src)
+        let dia = out.filter { $0.app == "Dia" }
+        XCTAssertEqual(dia.map(\.url), ["https://github.com/demo/pulls", "https://news.example.org/a", nil])  // title match; in-segment; other browser ignored
+        XCTAssertEqual(dia[0].host, "github.com"); XCTAssertEqual(dia[0].urlSrc, "history")
+        XCTAssertNil(out.first { $0.app == "code" }?.url)
+        let j = Query.timeline(day: "2026-11-01", segs: segs(evs), events: evs, sources: src)
+        guard case .a(let items)? = j["items"] else { return XCTFail() }
+        XCTAssertEqual(items.first?["url_src"]?.str, "history")
+        XCTAssertEqual(items.first?["host"]?.str, "github.com")
+    }
+
+    func testChatsJoinedToMessengerBlocks() {
+        let evs = [ev(0, "recorder.start"), app(0, "WeChat"), app(100, "code"), ev(200, "recorder.stop")]
+        func msg(_ s: Double, _ chat: String, _ dir: String, source: String = "wechat") -> Event {
+            ev(s, "source.\(source).message", [("source", .s(source)), ("id", .s("\(s)")), ("chat_name", .s(chat)), ("direction", .s(dir))])
+        }
+        let src = [msg(10, "Team", "in"), msg(20, "Team", "out"), msg(30, "Team", "in"), msg(40, "Mom", "out"),
+                   msg(150, "Team", "in"), msg(50, "Other", "in", source: "telegram")]
+        let j = Query.timeline(day: "2026-11-01", segs: segs(evs), events: evs, sources: src)
+        guard case .a(let items)? = j["items"], case .a(let chats)? = items[0]["chats"] else { return XCTFail() }
+        XCTAssertEqual(chats.map { $0["chat"]?.str }, ["Team", "Mom"])
+        XCTAssertEqual(chats[0]["in"]?.int, 2); XCTAssertEqual(chats[0]["out"]?.int, 1)
+        XCTAssertNil(items[1]["chats"])   // the 150 s message arrived while in "code"
+    }
+
+    func testTitleCommandsConfig() throws {
+        let f = NSTemporaryDirectory() + "lt-cfg-\(UUID().uuidString).json"
+        defer { try? FileManager.default.removeItem(atPath: f) }
+        try #"{"title_commands": {"dev.example.app": ["/usr/local/bin/t", "--x"], "bad.relative": ["t"], "bad.type": "x"}}"#
+            .write(toFile: f, atomically: true, encoding: .utf8)
+        let c = Config.load(f)
+        XCTAssertEqual(c.titleCommands, ["dev.example.app": ["/usr/local/bin/t", "--x"]])
+        XCTAssertEqual(c.json["title_commands"]?["dev.example.app"], .a([.s("/usr/local/bin/t"), .s("--x")]))
+    }
+
     func testAt() {
         let evs = [ev(0, "recorder.start"), app(0, "code"), ev(10, "presence.idle_start"), ev(20, "presence.idle_end"),
                    ev(30, "presence.lock"), ev(90, "presence.unlock"), app(90, "code"), ev(120, "recorder.stop")]
@@ -292,6 +337,18 @@ final class RedactTests: PinnedZoneCase {
                   "func searchable(_ e: Event) -> (String, String)?", "The password field is empty", "commit 2c32ffd"] {
             XCTAssertEqual(Redact.apply(s), s)
         }
+    }
+
+    func testMasksPersonalData() {
+        let u = Redact.url("https://example.com/x?h=1#/order-list?from=app&phone=13800000000&flat=29.5&flng=106.5&lat=29.5&lng=106.5&open_id=o1&city_id=18&timestamp=1793022927917")
+        for leak in ["13800000000", "29.5", "106.5", "open_id=o1"] { XCTAssertFalse(u.contains(leak), u) }
+        for kept in ["from=app", "city_id=18", "timestamp=1793022927917", "h=1"] { XCTAssertTrue(u.contains(kept), u) }
+        let q = Redact.url("https://example.com/s?q=swift&page=2&mobile=13900000000&user_email=a%40b.com")
+        XCTAssertTrue(q.contains("q=swift") && q.contains("page=2"), q)
+        XCTAssertFalse(q.contains("13900000000") || q.contains("a%40b.com"), q)
+        let t = Redact.apply("call 13700000000 or mail jane.doe@example.com; order 1793022927917, id 12345678901")
+        XCTAssertFalse(t.contains("13700000000") || t.contains("jane.doe@example.com"), t)
+        XCTAssertTrue(t.contains("1793022927917") && t.contains("12345678901"), t)
     }
 
     func testCapAndHash() {

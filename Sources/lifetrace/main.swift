@@ -142,8 +142,9 @@ case "timeline":
     let live = liveSegs().filter { $0.startMs >= from && $0.startMs < from + Zone.dayMs }
     let segs = idx.segments(from: from, to: from + Zone.dayMs) + live
     let evs = idx.events(from: from - 60_000, to: from + Zone.dayMs, limit: 100_000).filter { $0.type.hasPrefix("presence.") || $0.type.hasPrefix("recorder.") }
-    var j = Query.timeline(day: day, segs: segs, events: evs, openSegs: Set(live.map(\.seg)), raw: flag("--raw"))
-    if flag("--sources") { j = Query.interleave(j, idx.sourceEvents(from: from, to: from + Zone.dayMs, limit: 100_000)) }
+    let srcs = idx.sourceEvents(from: from - Query.historyLookbackMs, to: from + Zone.dayMs, limit: 500_000)
+    var j = Query.timeline(day: day, segs: segs, events: evs, openSegs: Set(live.map(\.seg)), raw: flag("--raw"), sources: srcs)
+    if flag("--sources") { j = Query.interleave(j, srcs.filter { $0.ts >= from }) }
     out(j) {
         print("\(day) timeline (UTC\(Zone.suffix))")
         if case .a(let items)? = j["items"] {
@@ -154,7 +155,10 @@ case "timeline":
                     print("  \(clock(it["start"]?.str))–\(clock(it["end"]?.str))  · away (\(it["why"]?.str ?? "")) \(hm(it["dur_s"]?.dbl ?? 0))")
                 } else {
                     let what = [it["app"]?.str, it["host"]?.str ?? it["title"]?.str].compactMap { $0 }.joined(separator: " — ")
-                    let extra = (it["glances"]?.int ?? 0) > 0 ? ", \(it["glances"]!.int!) glances elsewhere" : ""
+                    var extra = (it["glances"]?.int ?? 0) > 0 ? ", \(it["glances"]!.int!) glances elsewhere" : ""
+                    if case .a(let cs)? = it["chats"] {
+                        extra += "; chats: " + cs.map { c in "\(c["chat"]?.str ?? "?") \(c["in"]?.int ?? 0)↓\(c["out"]?.int ?? 0)↑" }.joined(separator: ", ")
+                    }
                     print("  \(clock(it["start"]?.str))–\(clock(it["end"]?.str))  \(what)  active \(hm(it["active_s"]?.dbl ?? 0)) of \(hm(it["dur_s"]?.dbl ?? 0))\(extra)\(it["open"] != nil ? " (in progress)" : "")")
                 }
             }
@@ -166,7 +170,8 @@ case "at":
     guard !positional.isEmpty, let t = Zone.parse(positional.joined(separator: " ")) else { die("usage: lifetrace at TIME") }
     let idx = openIndex()
     let live = liveSegs()
-    let segs = idx.segments(from: t - Zone.dayMs, to: t + Zone.dayMs) + live
+    let segs = Query.backfillURLs(idx.segments(from: t - Zone.dayMs, to: t + Zone.dayMs) + live,
+                                  sources: idx.sourceEvents(from: t - Zone.dayMs - Query.historyLookbackMs, to: t + Zone.dayMs, source: "browser", limit: 500_000))
     let evs = idx.events(from: t - 6 * 3_600_000, to: t + 3_600_000, limit: 100_000)
     let j = Query.at(t, segs: segs, events: evs, openSegs: Set(live.map(\.seg)),
                      sources: idx.sourceEvents(from: t - 120_000, to: t + 120_001, limit: 500))
@@ -186,7 +191,9 @@ case "stats":
     let idx = openIndex()
     guard let from = Zone.dayStart(days[0]), let to = Zone.dayStart(end).map({ $0 + Zone.dayMs }) else { die("bad date") }
     let live = liveSegs().filter { $0.startMs >= from && $0.startMs < to }
-    let j = Query.stats(days: days, segs: idx.segments(from: from, to: to) + live, top: Int(opt("--top") ?? "") ?? 15)
+    let segs = Query.backfillURLs(idx.segments(from: from, to: to) + live,
+                                  sources: idx.sourceEvents(from: from - Query.historyLookbackMs, to: to, source: "browser", limit: 500_000))
+    let j = Query.stats(days: days, segs: segs, top: Int(opt("--top") ?? "") ?? 15)
     out(j) {
         let t = j["totals"]
         print("\(days.first!)\(days.count > 1 ? " to \(end)" : "") stats (UTC\(Zone.suffix))")

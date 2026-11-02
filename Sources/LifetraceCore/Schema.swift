@@ -14,7 +14,7 @@ public enum Schema {
     static let ctx: [Field] = [
         ("app", "string", "app display name"), ("bundle", "string", "bundle id"), ("pid", "int", "process id"),
         ("win", "int", "CGWindowID of the focused window (needs Accessibility)"),
-        ("title", "string", "focused window title, spinner glyphs stripped (needs Accessibility)"),
+        ("title", "string", "focused window title, spinner glyphs stripped (needs Accessibility; title_commands output for configured apps)"),
         ("doc", "string", "document file path from AXDocument (needs Accessibility)"),
         ("url", "string", "browser page URL (AX or opt-in AppleScript)"), ("host", "string", "url host without www."),
         ("seg", "string", "segment id this focus event belongs to"),

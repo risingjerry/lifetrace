@@ -14,7 +14,7 @@ public enum Query {
         kv += [("start", .s(Zone.iso(s.startMs))), ("end", .s(Zone.iso(s.endMs))), ("dur_s", r(s.dur)), ("active_s", r(s.active)),
                ("idle_s", r(s.idle)), ("glance", .b(s.glance)), ("reason", .s(s.reason)),
                ("app", .opt(s.app)), ("bundle", .opt(s.bundle)), ("title", .opt(s.title)), ("host", .opt(s.host)),
-               ("url", .opt(s.url)), ("doc", .opt(s.doc))]
+               ("url", .opt(s.url)), ("url_src", .opt(s.urlSrc)), ("doc", .opt(s.doc))]
         if open { kv.append(("open", .b(true))) }
         return .o(kv.filter { !$0.1.isNull })
     }
@@ -49,11 +49,84 @@ public enum Query {
         var glances = 0
         var titleTime: [String: Double] = [:]
         var urlTime: [String: Double] = [:]
+        var historyURLs: Set<String> = []
         var open = false
     }
 
-    public static func timeline(day: String, segs: [Seg], events: [Event], openSegs: Set<String> = [], raw: Bool = false) -> J {
-        let all = segs.sorted { $0.startMs < $1.startMs }
+    // MARK: joining external records onto segments
+
+    static func titleCandidates(_ title: String) -> [(text: String, prefix: Bool)] {
+        var t = title.trimmingCharacters(in: .whitespaces)
+        var prefix = false
+        for ell in ["…", "..."] where t.hasSuffix(ell) { t = String(t.dropLast(ell.count)).trimmingCharacters(in: .whitespaces); prefix = true }
+        var out = [(t, prefix)]
+        // Browser window titles often carry a profile ("name: Page") or app ("Page - Google Chrome") wrapper.
+        if let r = t.range(of: ": "), t.distance(from: t.startIndex, to: r.lowerBound) <= 40 { out.append((String(t[r.upperBound...]), prefix)) }
+        if let r = t.range(of: " - ", options: .backwards) { out.append((String(t[..<r.lowerBound]), false)) }
+        return out.filter { $0.0.count >= 2 }
+    }
+
+    static func titleMatches(_ visit: String, _ cands: [(text: String, prefix: Bool)]) -> Bool {
+        cands.contains { c in c.prefix ? visit.hasPrefix(c.text) : (visit == c.text || (visit.count >= 4 && c.text.contains(visit))) }
+    }
+
+    public static let historyLookbackMs: Int64 = 12 * 3_600_000
+
+    /// Browser segments with no live URL (Chromium browsers rarely expose it) get one from browser history
+    /// records (`source.browser.visit`, field `browser` = app name): the latest visit up to the segment end
+    /// whose title matches the window title (within `historyLookbackMs`), else the latest visit inside the segment.
+    /// Filled-in segments carry `urlSrc = "history"`.
+    struct Visit { let ts: Int64; let url: String; let title: String }
+
+    public static func backfillURLs(_ segs: [Seg], sources: [Event]) -> [Seg] {
+        var byBrowser: [String: [Visit]] = [:]
+        for e in sources where e.type == "source.browser.visit" {
+            guard let b = e.str("browser"), let u = e.str("url") else { continue }
+            byBrowser[b, default: []].append(Visit(ts: e.ts, url: u, title: e.str("title") ?? ""))
+        }
+        guard !byBrowser.isEmpty else { return segs }
+        for k in Array(byBrowser.keys) { byBrowser[k]!.sort { $0.ts < $1.ts } }
+        var out = segs
+        for i in out.indices {
+            let s = out[i]
+            guard s.url == nil, let app = s.app, let visits = byBrowser[app], let h = historyVisit(s, visits) else { continue }
+            out[i].url = h.url
+            out[i].urlSrc = "history"
+            out[i].host = FocusCtx(url: h.url).host
+        }
+        return out
+    }
+
+    static func historyVisit(_ s: Seg, _ visits: [Visit]) -> Visit? {
+        let cands: [(text: String, prefix: Bool)] = s.title.map { titleCandidates($0) } ?? []
+        if !cands.isEmpty {
+            for v in visits.reversed() where v.ts <= s.endMs {
+                if v.ts < s.startMs - historyLookbackMs { break }
+                if !v.title.isEmpty && titleMatches(v.title, cands) { return v }
+            }
+        }
+        return visits.last { (v: Visit) -> Bool in v.ts >= s.startMs && v.ts <= s.endMs }
+    }
+
+    /// Chat records (any source record with `chat_name`, e.g. a messenger reader) that happened during a focus
+    /// block of the app they come from (block app name contains the source name, case-insensitive).
+    static func chats(_ app: String?, _ from: Int64, _ to: Int64, _ sources: [Event]) -> J? {
+        guard let app = app?.lowercased() else { return nil }
+        var agg: [String: (inC: Int, outC: Int, first: Int64)] = [:]
+        for e in sources where e.ts >= from && e.ts <= to {
+            guard let name = e.str("chat_name"), let src = e.str("source"), !src.isEmpty, app.contains(src.lowercased()) else { continue }
+            var a = agg[name] ?? (0, 0, e.ts)
+            if e.str("direction") == "out" { a.outC += 1 } else { a.inC += 1 }
+            agg[name] = a
+        }
+        guard !agg.isEmpty else { return nil }
+        let rows = agg.sorted { ($0.value.inC + $0.value.outC, -$0.value.first) > ($1.value.inC + $1.value.outC, -$1.value.first) }.prefix(8)
+        return .a(rows.map { .o([("chat", .s($0.key)), ("in", .i(Int64($0.value.inC))), ("out", .i(Int64($0.value.outC)))]) })
+    }
+
+    public static func timeline(day: String, segs: [Seg], events: [Event], openSegs: Set<String> = [], raw: Bool = false,
+                                sources: [Event] = []) -> J {
+        let all = backfillURLs(segs, sources: sources).sorted { $0.startMs < $1.startMs }
         var items: [(Int64, J)] = []
         if raw {
             items = all.map { ($0.startMs, segJ($0, open: openSegs.contains($0.seg))) }
@@ -81,6 +154,8 @@ public enum Query {
                     ("app", .opt(b.first.app)), ("bundle", .opt(b.first.bundle)), ("title", .opt(title)),
                     ("host", .opt(b.first.host)), ("url", .opt(url)), ("doc", .opt(b.first.doc)),
                     ("segs", .a(b.segs.map { .s($0) })), ("glances", .i(Int64(b.glances)))]
+                if let url, b.historyURLs.contains(url), let i = kv.firstIndex(where: { $0.0 == "url" }) { kv.insert(("url_src", .s("history")), at: i + 1) }
+                if let c = chats(b.first.app, b.first.startMs, b.end, sources) { kv.append(("chats", c)) }
                 if b.open { kv.append(("open", .b(true))) }
                 items.append((b.first.startMs, .o(kv.filter { !$0.1.isNull })))
             }
@@ -99,7 +174,7 @@ public enum Query {
         b.dur += s.dur; b.active += s.active; b.idle += s.idle
         if b.segs.last != s.seg { b.segs.append(s.seg) }
         if let t = s.title { b.titleTime[t, default: 0] += max(s.dur, 0.001) }
-        if let u = s.url { b.urlTime[u, default: 0] += max(s.dur, 0.001) }
+        if let u = s.url { b.urlTime[u, default: 0] += max(s.dur, 0.001); if s.urlSrc != nil { b.historyURLs.insert(u) } }
         if openSegs.contains(s.seg) { b.open = true }
     }
 

@@ -55,6 +55,8 @@ final class Daemon {
     var lastFocus: FocusCtx?
     var lastTitleCheck: Double = 0
     var titlePending = false
+    var lastTitleCommand: Double = 0
+    var titleCommandPending = false
     var noWebArea: Set<pid_t> = []
     var sources: [DispatchSourceSignal] = []
     var lockFD: Int32 = -1
@@ -322,6 +324,15 @@ final class Daemon {
     }
 
     func readCtx(_ pid: pid_t, app: String?, bundle: String?) -> FocusCtx {
+        var c = axCtx(pid, app: app, bundle: bundle)
+        if let b = bundle, let argv = cfg.titleCommands[b], let (title, doc) = runTitleCommand(argv, pid: pid) {
+            c.title = FocusCtx.normalizeTitle(title) ?? c.title
+            if let doc { c.doc = doc }
+        }
+        return c.redacted()
+    }
+
+    func axCtx(_ pid: pid_t, app: String?, bundle: String?) -> FocusCtx {
         var c = FocusCtx(app: app, bundle: bundle, pid: Int(pid))
         guard axOK else { return c }
         let el = AXUIElementCreateApplication(pid)
@@ -336,7 +347,42 @@ final class Daemon {
             else if let u = URL(string: d), u.isFileURL { c.doc = u.path }
         }
         if c.url == nil, let b = bundle, browserBundles.contains(b) { c.url = browserURL(pid, window: w, bundle: b) }
-        return c.redacted()
+        return c
+    }
+
+    /// Config `title_commands`: line 1 of stdout = title, optional line 2 = absolute document/folder path.
+    /// Bounded: 0.5 s timeout, 8 KB of output; a failing or silent command leaves the AX context unchanged.
+    func runTitleCommand(_ argv: [String], pid: pid_t) -> (String, String?)? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: argv[0])
+        p.arguments = Array(argv.dropFirst())
+        p.environment = (ProcessInfo.processInfo.environment).merging(["LIFETRACE_PID": String(pid)]) { $1 }
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let deadline = Date().addingTimeInterval(0.5)
+        while p.isRunning && Date() < deadline { usleep(5_000) }
+        if p.isRunning { p.terminate(); return nil }
+        guard p.terminationStatus == 0, let data = try? out.fileHandleForReading.read(upToCount: 8192),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let first = lines.first, !first.isEmpty else { return nil }
+        let doc = lines.count > 1 && lines[1].hasPrefix("/") ? String(lines[1].prefix(1024)) : nil
+        return (String(first.prefix(512)), doc)
+    }
+
+    /// Re-reads a `title_commands` app's context shortly after input in it: at most once per title_throttle_s,
+    /// and always once after the last input of a burst (so a tab switch by click or key is caught within seconds).
+    func scheduleTitleCommand() {
+        guard !titleCommandPending else { return }
+        titleCommandPending = true
+        let t = Date().timeIntervalSince1970
+        let delay = max(0.3, lastTitleCommand + cfg.titleThrottleS - t)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.titleCommandPending = false; self.lastTitleCommand = Date().timeIntervalSince1970
+            if !self.away { self.emitIfChanged("focus.title", touchContent: false) }
+        }
     }
 
     /// AXWebArea.AXURL via a bounded search (works where the browser exposes web content, e.g. Safari).
@@ -433,10 +479,10 @@ final class Daemon {
         }
     }
 
-    func emitIfChanged(_ type: String) {
+    func emitIfChanged(_ type: String, touchContent: Bool = true) {
         guard observedPid != 0, let prev = lastFocus, prev.pid == Int(observedPid) else { return }
         let c = readCtx(observedPid, app: prev.app, bundle: prev.bundle)
-        guard c != prev else { if type == "focus.title" { content.changed() }; return }
+        guard c != prev else { if type == "focus.title" && touchContent { content.changed() }; return }
         checkIdle()
         lastFocus = c
         emit(c.win != prev.win ? "focus.window" : type, c.fields)
@@ -483,6 +529,7 @@ final class Daemon {
         }
         segInput = segInput + c
         minuteInput = minuteInput + c
+        if let b = lastFocus?.bundle, cfg.titleCommands[b] != nil { scheduleTitleCommand() }
         if minuteTimer == nil {
             let n = now()
             minuteStartMs = n / 60_000 * 60_000
