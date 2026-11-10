@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>@LABEL@</string>
-  <key>ProgramArguments</key><array><string>@PYTHON@</string><string>-m</string><string>lifetrace_sources</string><string>run</string></array>
+  <key>ProgramArguments</key><array>@AGENT_RUN@<string>@PYTHON@</string><string>-m</string><string>lifetrace_sources</string><string>run</string></array>
   <key>WorkingDirectory</key><string>@REPO@</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>@PATH@</string></dict>
   <key>StartInterval</key><integer>900</integer>

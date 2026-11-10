@@ -158,6 +158,10 @@ python3 -m lifetrace_sources status
 python3 -m lifetrace_sources rescrub --data-dir ~/.local/share/lifetrace [--dedupe-shell-estimated] [--dry-run]
 ```
 
+If `~/.local/bin/agent-run` (or the path set by `AGENT_RUN`) is executable, the sources installer prepends it to the job command.
+This optional stable launcher keeps macOS privacy permissions tied to it rather than an upgrading Python; grant it the required access.
+Without an executable launcher, the command is unchanged.
+
 ### Resource Footprint
 
 Measured on the maintainer's Apple-silicon Mac while recording (`lifetrace status`), the Swift daemon uses **about 5 MB of memory footprint** and **about 0.04% average CPU** (this is one machine's observation; your mileage may vary with window-switching frequency). Source readers skip unchanged browser databases, git repositories, and folders, so a steady-state 15-minute run takes **about 2 s** instead of 20–30 s on a real machine.

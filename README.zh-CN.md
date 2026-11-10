@@ -158,6 +158,10 @@ python3 -m lifetrace_sources status
 python3 -m lifetrace_sources rescrub --data-dir ~/.local/share/lifetrace [--dedupe-shell-estimated] [--dry-run]
 ```
 
+若 `~/.local/bin/agent-run`（或 `AGENT_RUN` 指定的路径）可执行，数据源安装器会将它放在任务命令最前面。
+这个可选的稳定启动器让 macOS 隐私权限绑定到它，而不随 Python 升级改变；请给启动器授予所需权限。
+没有可执行的启动器时，命令保持原样。
+
 ### 资源占用
 
 在维护者的 Apple Silicon Mac 上日常记录时实测（通过 `lifetrace status` 查看），Swift 守护进程的**内存占用（footprint）约为 5 MB**，**平均 CPU 占用约为 0.04%**（此为单机实测观察值，实际占用会随窗口切换频率略有浮动）。数据源读取器会自动跳过未变更的浏览器数据库、Git 仓库与文件夹，因此日常每 15 分钟一次的稳态增量运行在真机上仅需**约 2 秒**（而非 20–30 秒）。

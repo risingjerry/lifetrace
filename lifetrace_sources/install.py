@@ -1,5 +1,6 @@
 """Render the sources LaunchAgent plist only; NEVER bootstrap/load it."""
 import argparse
+import os
 from pathlib import Path
 import plistlib
 import sys
@@ -19,6 +20,9 @@ def main():
               'LABEL': args.label, 'PATH': f'{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'}
     for key, value in values.items():
         text = text.replace('@' + key + '@', escape(value))
+    agent_run = Path(os.environ.get('AGENT_RUN', '~/.local/bin/agent-run')).expanduser()
+    text = text.replace('@AGENT_RUN@', f'<string>{escape(str(agent_run))}</string>'
+                        if agent_run.is_file() and os.access(agent_run, os.X_OK) else '')
     plistlib.loads(text.encode())  # Validate before writing.
     args.launch_agents.mkdir(parents=True, exist_ok=True)
     args.log.parent.mkdir(parents=True, exist_ok=True)

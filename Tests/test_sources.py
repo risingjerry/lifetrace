@@ -820,14 +820,15 @@ class Fixtures(unittest.TestCase):
 
     def test_install_template_without_loading(self):
         target, log = self.root / 'LaunchAgents', self.root / 'logs/sources.log'
+        env = dict(os.environ, HOME=str(self.home), AGENT_RUN=str(self.home / 'missing-agent-run'))
         # Explicit label: a maintainer's untracked config.mk may override the default.
         subprocess.run(['make', 'install-sources', f'LAUNCH_AGENTS={target}', f'SOURCES_LOG={log}',
-                        'SOURCES_LABEL=test.lifetrace.sources'], check=True, stdout=subprocess.PIPE)
+                        'SOURCES_LABEL=test.lifetrace.sources'], check=True, stdout=subprocess.PIPE, env=env)
         plist = plistlib.loads((target / 'test.lifetrace.sources.plist').read_bytes())
         self.assertEqual(plist['Label'], 'test.lifetrace.sources')
         self.assertNotIn('@', json.dumps(plist, default=str))
         subprocess.run([sys.executable, '-m', 'lifetrace_sources.install', '--launch-agents', str(target),
-                        '--log', str(log)], check=True, stdout=subprocess.PIPE)
+                        '--log', str(log)], check=True, stdout=subprocess.PIPE, env=env)
         self.assertEqual(plistlib.loads((target / 'dev.lifetrace.sources.plist').read_bytes())['Label'],
                          'dev.lifetrace.sources')
         self.assertEqual(plist['StartInterval'], 900)
@@ -835,6 +836,31 @@ class Fixtures(unittest.TestCase):
         self.assertTrue(plist['LowPriorityIO'])
         self.assertEqual(plist['ProgramArguments'][1:], ['-m', 'lifetrace_sources', 'run'])
         self.assertNotIn('KeepAlive', plist)
+
+    def test_install_optional_agent_run(self):
+        target, log = self.root / 'LaunchAgents', self.root / 'logs/sources.log'
+        env = dict(os.environ, HOME=str(self.home))
+        env.pop('AGENT_RUN', None)
+
+        def render():
+            subprocess.run([sys.executable, '-m', 'lifetrace_sources.install', '--launch-agents', str(target),
+                            '--log', str(log)], check=True, stdout=subprocess.PIPE, env=env)
+            return plistlib.loads((target / 'dev.lifetrace.sources.plist').read_bytes())
+
+        original = render()
+        self.assertEqual(original['ProgramArguments'][1:], ['-m', 'lifetrace_sources', 'run'])
+        for name, override in (('.local/bin/agent-run', None), ('custom & <runner>', '~/custom & <runner>')):
+            launcher = self.path(name)
+            if override:
+                env['AGENT_RUN'] = override
+            for mode in (None, 0o644, 0o755):
+                with self.subTest(name=name, mode=mode):
+                    if mode is not None:
+                        launcher.write_text('#!/bin/sh\nexit 0\n')
+                        launcher.chmod(mode)
+                    expected = dict(original, ProgramArguments=([str(launcher)] if mode == 0o755 else [])
+                                    + original['ProgramArguments'])
+                    self.assertEqual(render(), expected)
 
     def test_utc_offset_config_env_and_machine_default(self):
         self.assertEqual(core.parse_offset('+08:00'), dt.timedelta(hours=8))
