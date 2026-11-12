@@ -192,7 +192,12 @@ record that mirror without a response item are not supported.
 A session summary is a **cumulative, append-only snapshot**, not a final/closed
 session claim. `ts=end`; a changed session emits a new summary ID based on its
 revision. Consumers should choose the latest revision per transcript/session,
-not sum snapshots. Initial summary counts cover the readable transcript, possibly
+not sum snapshots. When a changed transcript's saved byte offset no longer follows
+a newline (for example after an in-place rewrite), the reader restarts that file
+and rebuilds its cumulative summary, using the normal initial backfill bound and
+stable-ID deduplication. This detects misaligned cursors, not all possible rewrites;
+complete malformed JSON lines still report an error. Initial summary counts cover
+the readable transcript, possibly
 including activity older than the event backfill bound. Transcripts without any
 source timestamp produce no fabricated summary. No tool outputs, tool inputs,
 assistant text or reasoning are persisted. Known large irrelevant tool/API blobs

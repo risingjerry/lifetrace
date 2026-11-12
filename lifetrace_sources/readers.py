@@ -172,6 +172,15 @@ def sessions(ctx, state, source):
                 continue
             if offset == st.st_size:
                 continue
+            if offset:
+                with path.open('rb') as stream:
+                    stream.seek(offset - 1)
+                    boundary = stream.read(1) == b'\n'
+                if not boundary:
+                    # An in-place rewrite can keep the inode and grow past the
+                    # saved cursor. Rebuild rather than parse a JSON suffix or
+                    # carry the previous transcript's cumulative counts forward.
+                    old, offset = {}, 0
             summary = dict(old.get('summary', {}))
             tools = dict(summary.get('tool_calls', {}))
             turns = summary.get('turns', 0)

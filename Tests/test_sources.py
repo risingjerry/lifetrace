@@ -565,6 +565,33 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(self.run_reader('codex')['count'], 2)
         self.assertEqual(self.run_reader('codex')['count'], 0)
 
+    def test_codex_rewritten_file_recovers_stale_cursor(self):
+        p = self.path('.codex/sessions/rewrite.jsonl')
+        def item(text):
+            return dict(timestamp=core.iso(NOW), type='response_item',
+                        payload=dict(type='message', role='user', content=text))
+        self.jsonl(p, [item('original')])
+        self.assertEqual(self.run_reader('codex')['status'], 'ok')
+        inode, offset = p.stat().st_ino, p.stat().st_size
+        # In-place rewrite grows the file but leaves the old offset inside JSON.
+        self.jsonl(p, [item('replacement ' * 30), item('following prompt')])
+        self.assertEqual(p.stat().st_ino, inode)
+        self.assertGreater(p.stat().st_size, offset)
+        self.assertNotEqual(p.read_bytes()[offset - 1:offset], b'\n')
+        report = self.run_reader('codex')
+        self.assertEqual(report['status'], 'ok')
+        rows = self.events('codex')
+        self.assertIn('following prompt', [r.get('text') for r in rows])
+        self.assertEqual(rows[-1]['turns'], 2)  # Rebuild, do not add old summary.
+        self.assertEqual(self.run_reader('codex')['count'], 0)
+
+    def test_codex_malformed_complete_line_still_reports_error(self):
+        p = self.path('.codex/sessions/malformed.jsonl')
+        p.write_text('{invalid json}\n')
+        report = self.run_reader('codex')
+        self.assertEqual(report['status'], 'unavailable')
+        self.assertEqual(report['issues'], [{'target': 'codex', 'reason': 'ValueError'}])
+
     def test_large_ignored_transcript_blobs_and_partial_retry(self):
         p = self.path('.codex/sessions/blob.jsonl')
         stamp = core.iso(NOW)
